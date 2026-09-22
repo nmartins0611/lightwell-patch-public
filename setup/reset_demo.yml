@@ -529,6 +529,11 @@
         state: directory
         mode: "0777"
 
+    - name: Remove leftover config-service baseline checkout
+      ansible.builtin.file:
+        path: "{{ baseline_src }}"
+        state: absent
+
     - name: Clone config-service from Gitea (post-reset pin)
       ansible.builtin.git:
         repo: "{{ gitea_url }}/{{ gitea_owner }}/{{ app_name }}.git"
@@ -602,6 +607,11 @@
         path: "{{ app_sbom_dir }}"
         state: directory
         mode: "0777"
+
+    - name: Remove leftover simple-webapp baseline checkout
+      ansible.builtin.file:
+        path: "{{ baseline_src }}"
+        state: absent
 
     - name: Clone simple-webapp from Gitea (post-reset pin)
       ansible.builtin.git:
