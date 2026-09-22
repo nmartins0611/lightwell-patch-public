@@ -1,0 +1,520 @@
+{
+  "name": "Lightwell CVE Remediation - Neuromancer",
+  "description": "CVE lifecycle workflow using aap.example.com. Phase 1: CVE Correlation (TPA SBOM lookup) + AI Triage decides route. Phase 2a: OS patch path (container test -> approval -> patch -> close loop). Phase 2b: CME mitigation (no patch available - triage report -> human approval -> CME mitigate -> CME verify). Phase 2c: App GitOps path (Lightwell PyPI fix -> create PR -> script polls Gitea CI -> done). Phase 2d: Log only (low severity). LLM: drc maas sonnet 4.6. AAP: Neuromancer integration.",
+  "schema_version": "2.0.0",
+  "triggers": [
+    {
+      "id": "trigger_cve",
+      "name": "CVE Disclosed (EDA Webhook / Manual)",
+      "type": "manual_trigger",
+      "position": {
+        "x": 0,
+        "y": 400
+      },
+      "parameters": {
+        "input_schema": {
+          "type": "object",
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "properties": {
+            "demo_cve_id": {
+              "type": "string"
+            },
+            "demo_cwe_ids": {
+              "type": "string"
+            },
+            "demo_app_cve_id": {
+              "type": "string"
+            },
+            "demo_advisory_id": {
+              "type": "string"
+            },
+            "demo_cve_package": {
+              "type": "string"
+            },
+            "demo_cvss_vector": {
+              "type": "string"
+            },
+            "demo_app_fixed_version": {
+              "type": "string"
+            },
+            "demo_cve_fixed_version": {
+              "type": "string"
+            },
+            "demo_app_affected_library": {
+              "type": "string"
+            },
+            "demo_cve_vulnerable_version": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": true
+        }
+      }
+    }
+  ],
+  "nodes": [
+    {
+      "id": "correlate_cve_job",
+      "name": "CVE Correlation - TPA SBOM Lookup",
+      "type": "aap_job_template",
+      "position": {
+        "x": 400,
+        "y": 400
+      },
+      "parameters": {
+        "diff_mode": false,
+        "job_template_name": "CVE Correlation",
+        "organization_name": "Default"
+      }
+    },
+    {
+      "id": "triage_agent",
+      "name": "[AI] CVE Triage - Patch Availability and Route Decision",
+      "type": "agentic",
+      "position": {
+        "x": 800,
+        "y": 400
+      },
+      "parameters": {
+        "prompt": "You are a CVE triage coordinator. The CVE correlation job has completed.\n\nCVE ID: ${trigger.demo_cve_id}\nAffected package: ${trigger.demo_cve_package}\nCVSS vector: ${trigger.demo_cvss_vector}\nApp CVE ID: ${trigger.demo_app_cve_id}\nApp affected library: ${trigger.demo_app_affected_library}\nApp fixed version: ${trigger.demo_app_fixed_version}\nRHSA Advisory ID: ${trigger.demo_advisory_id}\n\nCorrelation results from TPA SBOM lookup:\n- Systems affected: ${correlate_cve_job.artifacts.ao_is_affected}\n- Affected count: ${correlate_cve_job.artifacts.ao_affected_count}\n- CVSS score: ${correlate_cve_job.artifacts.ao_cvss_score}\n- High severity: ${correlate_cve_job.artifacts.ao_high_severity}\n\nStep 1 - Determine CVE type:\n- If demo_app_cve_id is set and demo_app_fixed_version is set, this is an APP-LEVEL dependency CVE (pip/PyPI package). Lightwell has published a fix to PyPI.\n- Otherwise this is an OS-level package CVE.\n\nStep 2 - For APP-LEVEL CVE:\n- Route is ALWAYS 'gitops_app_patch' when demo_app_fixed_version is set.\n- No need to check Red Hat Security API.\n\nStep 3 - For OS-LEVEL CVE only:\n- If RHSA Advisory ID shown above is not empty, a patch exists. Set patch_available: true, advisory_id to that value, route to 'patch'. STOP.\n- If RHSA Advisory ID is empty and CVSS >= 7.0, route 'cme_mitigate'.\n- If RHSA Advisory ID is empty and CVSS < 7.0, route 'log_only'.\n\nOutput ONLY valid JSON:\n{\n  \"patch_available\": true,\n  \"advisory_id\": \"RHSA-XXXX:XXXX or empty string\",\n  \"route\": \"patch or cme_mitigate or log_only or gitops_app_patch\",\n  \"urgency\": \"CRITICAL or HIGH or LOW\",\n  \"cvss_score\": 10.0,\n  \"affected_count\": 3,\n  \"reasoning\": \"one sentence explaining the routing decision\"\n}",
+        "response_schema": {
+          "type": "object",
+          "properties": {
+            "route": {
+              "type": "string"
+            },
+            "urgency": {
+              "type": "string"
+            },
+            "reasoning": {
+              "type": "string"
+            },
+            "cvss_score": {
+              "type": "number"
+            },
+            "advisory_id": {
+              "type": "string"
+            },
+            "affected_count": {
+              "type": "number"
+            },
+            "patch_available": {
+              "type": "boolean"
+            }
+          }
+        },
+        "tool_selection_strategy": "NONE"
+      }
+    },
+    {
+      "id": "route_switch",
+      "name": "CVE Route Decision",
+      "type": "switch",
+      "position": {
+        "x": 1200,
+        "y": 400
+      },
+      "parameters": {
+        "cases": [
+          {
+            "port": "case_0",
+            "label": "Patch Available - Test and Deploy",
+            "condition": "${triage_agent.result.content.route} == \"patch\""
+          },
+          {
+            "port": "case_1",
+            "label": "No Patch High Risk - CME Mitigate",
+            "condition": "${triage_agent.result.content.route} == \"cme_mitigate\""
+          },
+          {
+            "port": "case_2",
+            "label": "App Dependency - GitOps PR via Lightwell PyPI",
+            "condition": "${triage_agent.result.content.route} == \"gitops_app_patch\""
+          },
+          {
+            "port": "case_3",
+            "label": "No Patch Low Risk - Log Only",
+            "condition": "${triage_agent.result.content.route} == \"log_only\""
+          }
+        ],
+        "default_port": "default"
+      }
+    },
+    {
+      "id": "container_test_job",
+      "name": "Container Test - Validate Patch Before Production",
+      "type": "aap_job_template",
+      "position": {
+        "x": 1510.598870056497,
+        "y": -98.23728813559319
+      },
+      "parameters": {
+        "diff_mode": false,
+        "extra_vars": {
+          "demo_cve_fixed_version": "${trigger.demo_cve_fixed_version}",
+          "demo_cve_vulnerable_version": "${trigger.demo_cve_vulnerable_version}"
+        },
+        "job_template_name": "Container Test",
+        "organization_name": "Default"
+      }
+    },
+    {
+      "id": "safe_to_deploy_switch",
+      "name": "Container Test Passed?",
+      "type": "switch",
+      "position": {
+        "x": 1827.0282485875705,
+        "y": -82.44632768361583
+      },
+      "parameters": {
+        "cases": [
+          {
+            "port": "case_0",
+            "label": "Safe to Deploy",
+            "condition": "${container_test_job.artifacts.ao_safe_to_deploy} == \"true\""
+          }
+        ],
+        "default_port": "default"
+      }
+    },
+    {
+      "id": "approval_prod",
+      "name": "Approve Production Patch",
+      "type": "approval",
+      "position": {
+        "x": 2331.9774011299432,
+        "y": -187.88135593220332
+      },
+      "parameters": {}
+    },
+    {
+      "id": "patch_and_verify_job",
+      "name": "Patch and Verify - Production",
+      "type": "aap_job_template",
+      "position": {
+        "x": 2693.1073446327687,
+        "y": -280.92655367231635
+      },
+      "parameters": {
+        "diff_mode": false,
+        "job_template_name": "Patch and Verify",
+        "organization_name": "Default"
+      }
+    },
+    {
+      "id": "close_loop_job",
+      "name": "Close Loop - Upload SBOMs, Remove CME Controls, Final Report",
+      "type": "aap_job_template",
+      "position": {
+        "x": 3065.8983050847455,
+        "y": -290.64406779661016
+      },
+      "parameters": {
+        "diff_mode": false,
+        "job_template_name": "Close Loop",
+        "organization_name": "Default"
+      }
+    },
+    {
+      "id": "container_test_failed_agent",
+      "name": "[AI] Container Test Failed - Escalate",
+      "type": "agentic",
+      "position": {
+        "x": 2376.6553672316386,
+        "y": 97.3446327683616
+      },
+      "parameters": {
+        "prompt": "The container smoke test FAILED for ${trigger.demo_cve_id}.\n\nTest result: ${container_test_job.artifacts.ao_test_result}\nPre-patch version: ${container_test_job.artifacts.ao_pre_patch_version}\nPost-patch version: ${container_test_job.artifacts.ao_post_patch_version}\n\nThe patch may introduce a regression. Production patching has been HALTED.\n\nGenerate a brief escalation summary:\n1. What failed\n2. Why production patching was halted\n3. Recommended next steps\n\nOutput ONLY valid JSON:\n{\n  \"escalation_summary\": \"string\",\n  \"recommended_actions\": \"string\",\n  \"severity\": \"HIGH\"\n}",
+        "response_schema": {
+          "type": "object",
+          "properties": {
+            "severity": {
+              "type": "string"
+            },
+            "escalation_summary": {
+              "type": "string"
+            },
+            "recommended_actions": {
+              "type": "string"
+            }
+          }
+        },
+        "tool_selection_strategy": "NONE"
+      }
+    },
+    {
+      "id": "create_ai_triage_report",
+      "name": "Create AI Triage Report",
+      "type": "aap_job_template",
+      "position": {
+        "x": 1590.2824858757062,
+        "y": 275.43502824858757
+      },
+      "parameters": {
+        "diff_mode": false,
+        "extra_vars": {
+          "demo_cve_id": "${trigger.demo_cve_id}",
+          "demo_cve_package": "${trigger.demo_cve_package}",
+          "demo_cvss_vector": "${trigger.demo_cvss_vector}",
+          "demo_cwe_ids": "${trigger.demo_cwe_ids}"
+        },
+        "job_template_name": "AI CVE Triage",
+        "organization_name": "Default"
+      }
+    },
+    {
+      "id": "approval_cme",
+      "name": "Approve CME Compensating Controls",
+      "type": "approval",
+      "position": {
+        "x": 1900,
+        "y": 275.43502824858757
+      },
+      "parameters": {}
+    },
+    {
+      "id": "cme_mitigate_job",
+      "name": "CME Mitigate - Apply Compensating Controls",
+      "type": "aap_job_template",
+      "position": {
+        "x": 2200,
+        "y": 275.43502824858757
+      },
+      "parameters": {
+        "diff_mode": false,
+        "extra_vars": {
+          "rhtpa_api_endpoint": "http://<AAP_HOST>:8443"
+        },
+        "job_template_name": "CME Mitigate",
+        "organization_name": "Default"
+      }
+    },
+    {
+      "id": "cme_verify_job",
+      "name": "CME Verify - CVSS Attenuation Before vs After",
+      "type": "aap_job_template",
+      "position": {
+        "x": 2600,
+        "y": 275.43502824858757
+      },
+      "parameters": {
+        "diff_mode": false,
+        "job_template_name": "CME Verify",
+        "organization_name": "Default"
+      }
+    },
+    {
+      "id": "sbom_repo_analysis_agent",
+      "name": "[AI] SBOM Correlation - Which Repos Need the Fix?",
+      "type": "agentic",
+      "position": {
+        "x": 1687.819209039548,
+        "y": 549.6610169491524
+      },
+      "parameters": {
+        "prompt": "You are a security remediation coordinator. A Lightwell fix has been published for an app dependency CVE.\n\nCVE: ${trigger.demo_app_cve_id}\nVulnerable library: ${trigger.demo_app_affected_library}\nFixed version (from Lightwell PyPI): ${trigger.demo_app_fixed_version}\n\nTPA SBOM correlation results from the upstream CVE Correlation job:\n- Systems affected: ${correlate_cve_job.artifacts.ao_is_affected}\n- Affected system count: ${correlate_cve_job.artifacts.ao_affected_count}\n- CVSS score: ${correlate_cve_job.artifacts.ao_cvss_score}\n\nThe correlation job scanned the SBOMs of all managed systems in TPA. The affected systems are running the config-service application which uses ${trigger.demo_app_affected_library} as a pip dependency in requirements.txt.\n\nYour task:\n1. Based on the SBOM correlation results, identify which application repo needs a fix.\n   The affected systems run 'config-service' - this maps to the Gitea repo 'config-service' owned by 'demo-admin'.\n2. The vulnerable pin is: ${trigger.demo_app_affected_library}==6.0.1 in requirements.txt\n3. The fix pin is: ${trigger.demo_app_affected_library}==${trigger.demo_app_fixed_version}\n4. Construct a clear PR title and confirm all parameters for the downstream GitOps PR creation job.\n\nOutput ONLY valid JSON:\n{\n  \"repo_name\": \"config-service\",\n  \"repo_owner\": \"demo-admin\",\n  \"dependency_file\": \"requirements.txt\",\n  \"affected_library\": \"${trigger.demo_app_affected_library}\",\n  \"current_version\": \"6.0.1\",\n  \"fixed_version\": \"${trigger.demo_app_fixed_version}\",\n  \"affected_systems_count\": 3,\n  \"pr_title\": \"fix(security): ${trigger.demo_app_cve_id} - update ${trigger.demo_app_affected_library} to ${trigger.demo_app_fixed_version}\",\n  \"reasoning\": \"one sentence explaining the correlation between affected systems and the repo to fix\"\n}",
+        "response_schema": {
+          "type": "object",
+          "properties": {
+            "pr_title": {
+              "type": "string"
+            },
+            "reasoning": {
+              "type": "string"
+            },
+            "repo_name": {
+              "type": "string"
+            },
+            "repo_owner": {
+              "type": "string"
+            },
+            "fixed_version": {
+              "type": "string"
+            },
+            "current_version": {
+              "type": "string"
+            },
+            "dependency_file": {
+              "type": "string"
+            },
+            "affected_library": {
+              "type": "string"
+            },
+            "affected_systems_count": {
+              "type": "number"
+            }
+          }
+        },
+        "tool_selection_strategy": "NONE"
+      }
+    },
+    {
+      "id": "gitops_create_pr_job",
+      "name": "App GitOps - Create PR (Lightwell PyPI Fix)",
+      "type": "aap_job_template",
+      "position": {
+        "x": 2219.9774011299432,
+        "y": 549.6610169491526
+      },
+      "parameters": {
+        "diff_mode": false,
+        "extra_vars": {
+          "demo_app_name": "${sbom_repo_analysis_agent.result.content.repo_name}",
+          "demo_gitea_url": "http://<GITEA_HOST>:3000",
+          "demo_app_cve_id": "${trigger.demo_app_cve_id}",
+          "demo_gitea_owner": "${sbom_repo_analysis_agent.result.content.repo_owner}",
+          "demo_app_fixed_version": "${sbom_repo_analysis_agent.result.content.fixed_version}",
+          "demo_lightwell_pypi_url": "http://<GITEA_HOST>:8081/simple/",
+          "demo_app_dependency_file": "${sbom_repo_analysis_agent.result.content.dependency_file}",
+          "demo_app_affected_library": "${sbom_repo_analysis_agent.result.content.affected_library}"
+        },
+        "job_template_name": "App GitOps Remediate",
+        "organization_name": "Default"
+      }
+    },
+    {
+      "id": "wait_for_gitea_ci",
+      "name": "[Script] Wait for PR Merge and Gitea CI Pipeline",
+      "type": "script",
+      "position": {
+        "x": 2613.966101694916,
+        "y": 549.6610169491526
+      },
+      "parameters": {
+        "code": "import urllib.request, json, os, time, base64\n\ngitea_base = os.getenv('GITEA_URL', 'http://<AAP_HOST>:3000')\npr_number  = os.getenv('PR_NUMBER', '')\nusername   = os.getenv('GITEA_USER', 'demo-admin')\npassword   = os.getenv('GITEA_PASS', '')\nowner      = os.getenv('REPO_OWNER', 'demo-admin')\nrepo       = os.getenv('REPO_NAME', 'config-service')\n\nif not pr_number:\n    raise Exception('PR_NUMBER not set - check set_stats in App GitOps Remediate playbook')\n\ncreds = base64.b64encode(f'{username}:{password}'.encode()).decode()\nheaders = {'Authorization': f'Basic {creds}'}\n\ndef get(url):\n    req = urllib.request.Request(url, headers=headers)\n    return json.loads(urllib.request.urlopen(req, timeout=10).read().decode())\n\nprint(f'Waiting for PR #{pr_number} to be merged in Gitea...')\nmerge_sha = None\nfor _ in range(60):\n    pr = get(f'{gitea_base}/api/v1/repos/{owner}/{repo}/pulls/{pr_number}')\n    if pr.get('merged'):\n        merge_sha = pr.get('merge_commit_sha', '')\n        print(f'PR #{pr_number} merged: {merge_sha[:8]}')\n        break\n    if pr.get('state') == 'closed' and not pr.get('merged'):\n        raise Exception(f'PR #{pr_number} closed without merging')\n    time.sleep(30)\nelse:\n    raise Exception('Timeout: PR not merged after 30 minutes')\n\nprint('Waiting for Gitea Actions CI pipeline to complete...')\nfor i in range(40):\n    runs = get(f'{gitea_base}/api/v1/repos/{owner}/{repo}/actions/runs?limit=5')\n    items = runs.get('workflow_runs', runs.get('items', []))\n    matching = [r for r in items if merge_sha[:8] in r.get('head_sha', '')]\n    if matching:\n        run = matching[0]\n        status = run.get('status', '')\n        conclusion = run.get('conclusion', '')\n        if status == 'completed' or conclusion in ('success',):\n            print(json.dumps({'ci_passed': True,'run_id': str(run.get('id', '')),'conclusion': conclusion or status,'pr_number': pr_number,'merge_sha': merge_sha}))\n            break\n        if conclusion in ('failure', 'cancelled'):\n            raise Exception(f'Gitea CI failed: {conclusion}')\n    time.sleep(30)\nelse:\n    raise Exception('Timeout: Gitea CI not completed after 20 minutes')\n",
+        "language": "python",
+        "environment": {
+          "GITEA_URL": "http://<GITEA_HOST>:3000",
+          "PR_NUMBER": "${gitops_create_pr_job.artifacts.ao_pr_number}",
+          "REPO_NAME": "config-service",
+          "GITEA_PASS": "",
+          "GITEA_USER": "demo-admin",
+          "REPO_OWNER": "demo-admin"
+        }
+      }
+    },
+    {
+      "id": "sbom_rescan_job",
+      "name": "SBOM Scan and Upload - Confirm CVE Resolved in TPA",
+      "type": "aap_job_template",
+      "position": {
+        "x": 2980.7457627118647,
+        "y": 539.9435028248587
+      },
+      "parameters": {
+        "diff_mode": false,
+        "job_template_name": "SBOM Scan and Upload",
+        "organization_name": "Default"
+      }
+    },
+    {
+      "id": "log_only_agent",
+      "name": "[AI] Log Low Severity CVE - No Immediate Action",
+      "type": "agentic",
+      "position": {
+        "x": 1576,
+        "y": 900
+      },
+      "parameters": {
+        "prompt": "CVE ${trigger.demo_cve_id} assessed as LOW severity or systems not affected.\n\nTriage result:\n- Route: ${triage_agent.result.content.route}\n- Urgency: ${triage_agent.result.content.urgency}\n- Affected systems: ${triage_agent.result.content.affected_count}\n- Reasoning: ${triage_agent.result.content.reasoning}\n\nGenerate a log entry. No immediate remediation needed but track for future.\n\nOutput ONLY valid JSON:\n{\n  \"log_entry\": \"string\",\n  \"recommended_monitoring\": \"string\",\n  \"review_in_days\": 30\n}",
+        "response_schema": {
+          "type": "object",
+          "properties": {
+            "log_entry": {
+              "type": "string"
+            },
+            "review_in_days": {
+              "type": "number"
+            },
+            "recommended_monitoring": {
+              "type": "string"
+            }
+          }
+        },
+        "tool_selection_strategy": "NONE"
+      }
+    }
+  ],
+  "edges": [
+    {
+      "from": "trigger_cve",
+      "to": "correlate_cve_job"
+    },
+    {
+      "from": "correlate_cve_job",
+      "to": "triage_agent"
+    },
+    {
+      "from": "triage_agent",
+      "to": "route_switch"
+    },
+    {
+      "from": "route_switch",
+      "to": "container_test_job",
+      "from_port": "case_0"
+    },
+    {
+      "from": "container_test_job",
+      "to": "safe_to_deploy_switch"
+    },
+    {
+      "from": "safe_to_deploy_switch",
+      "to": "approval_prod",
+      "from_port": "case_0"
+    },
+    {
+      "from": "safe_to_deploy_switch",
+      "to": "container_test_failed_agent",
+      "from_port": "default"
+    },
+    {
+      "from": "approval_prod",
+      "to": "patch_and_verify_job",
+      "from_port": "approved"
+    },
+    {
+      "from": "patch_and_verify_job",
+      "to": "close_loop_job"
+    },
+    {
+      "from": "route_switch",
+      "to": "create_ai_triage_report",
+      "from_port": "case_1"
+    },
+    {
+      "from": "create_ai_triage_report",
+      "to": "approval_cme"
+    },
+    {
+      "from": "approval_cme",
+      "to": "cme_mitigate_job",
+      "from_port": "approved"
+    },
+    {
+      "from": "cme_mitigate_job",
+      "to": "cme_verify_job"
+    },
+    {
+      "from": "route_switch",
+      "to": "sbom_repo_analysis_agent",
+      "from_port": "case_2"
+    },
+    {
+      "from": "sbom_repo_analysis_agent",
+      "to": "gitops_create_pr_job"
+    },
+    {
+      "from": "gitops_create_pr_job",
+      "to": "wait_for_gitea_ci"
+    },
+    {
+      "from": "wait_for_gitea_ci",
+      "to": "sbom_rescan_job"
+    },
+    {
+      "from": "route_switch",
+      "to": "log_only_agent",
+      "from_port": "case_3"
+    }
+  ]
+}
