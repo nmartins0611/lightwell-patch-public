@@ -22,14 +22,16 @@
     pg_db_password: "{{ vault_pg_db_password }}"
     keycloak_container_name: "keycloak"
     keycloak_realm: "trustification"
-    keycloak_issuer_url: "http://{{ keycloak_container_name }}:{{ keycloak_port | default(8080) }}/realms/{{ keycloak_realm }}"
+    # Browser-facing issuer. Must be a hostname the user's browser can
+    # resolve (not the Podman DNS name "keycloak"). Token `iss` matches
+    # Keycloak KC_HOSTNAME (http://{{ ansible_host }}:8180).
+    keycloak_issuer_url: "https://{{ ansible_host }}:8180/realms/{{ keycloak_realm }}"
 
   tasks:
     - name: Ensure podman is installed
       ansible.builtin.dnf:
         name:
           - podman
-          - podman-plugins
         state: present
       become: true
 

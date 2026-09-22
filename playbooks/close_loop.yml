@@ -188,11 +188,62 @@
           audit_trail_complete: true
           timestamp: "{{ ansible_date_time.iso8601 }}"
 
+    - name: Ensure report directory exists
+      ansible.builtin.file:
+        path: "{{ report_output_dir }}"
+        state: directory
+        mode: "0750"
+
     - name: Write final report locally
       ansible.builtin.copy:
         content: "{{ final_report | to_nice_json }}"
         dest: "{{ report_output_dir }}/final-report-{{ cve_id }}.json"
         mode: "0644"
+
+    - name: Resolve ServiceNow incident
+      servicenow.itsm.incident:
+        state: resolved
+        number: "{{ snow_incident_number }}"
+        close_code: "Solved (Permanently)"
+        close_notes: |
+          {{ cve_id }} remediated via {{ advisory_id }}.
+
+          Patch applied to all {{ groups['targets'] | length }} affected hosts.
+          Post-patch SBOMs uploaded to RHTPA — CVE no longer present.
+          Compensating controls removed — patch is the permanent fix.
+
+          Full lifecycle report: {{ report_server_url }}/final-report-{{ cve_id }}.html
+          Resolved by AAP job {{ tower_job_id | default('N/A') }}
+        instance:
+          host: "{{ snow_instance_host }}"
+          username: "{{ vault_snow_username }}"
+          password: "{{ vault_snow_password }}"
+      when: snow_enabled | bool and snow_incident_number is defined
+
+    - name: Clear CVE exposure from CMDB CIs
+      servicenow.itsm.configuration_item:
+        sys_class_name: "{{ snow_cmdb_class }}"
+        name: "{{ hostvars[item]['ansible_host'] | default(item) }}"
+        other:
+          u_active_cve: ""
+          u_cve_cvss_score: ""
+          u_cve_affected_package: ""
+          u_cve_incident: ""
+          u_cve_remediated_at: "{{ ansible_date_time.iso8601 }}"
+          u_cve_remediated_by: "{{ advisory_id }}"
+        instance:
+          host: "{{ snow_instance_host }}"
+          username: "{{ vault_snow_username }}"
+          password: "{{ vault_snow_password }}"
+      loop: "{{ groups['targets'] }}"
+      when: snow_enabled | bool and snow_incident_number is defined
+
+    - name: Display ServiceNow closure
+      ansible.builtin.debug:
+        msg: >-
+          ServiceNow incident {{ snow_incident_number }} resolved.
+          CMDB CIs cleared of {{ cve_id }} exposure data.
+      when: snow_enabled | bool and snow_incident_number is defined
 
     - name: Display final summary
       ansible.builtin.debug:

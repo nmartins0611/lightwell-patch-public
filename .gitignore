@@ -1,5 +1,6 @@
 # Local Ansible Vault — never commit the real file
 vars/vault.yml
+vars/vault.yml.real
 inventory/**/vault.yml
 inventory/**/*vault*
 
@@ -21,6 +22,12 @@ __pycache__/
 
 # EE build context
 execution-environment/context/
+
+# Environment-specific docs
+docs/
+
+# Snapshot manifests (contain instance IDs)
+.snapshot-manifest.json
 
 # OS
 .DS_Store

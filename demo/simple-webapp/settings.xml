@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<settings xmlns="http://maven.apache.org/SETTINGS/1.2.0"
+          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:schemaLocation="http://maven.apache.org/SETTINGS/1.2.0 https://maven.apache.org/xsd/settings-1.2.0.xsd">
+  <mirrors>
+    <mirror>
+      <id>maven-default-http-blocker</id>
+      <mirrorOf>external:dont:block:http:*</mirrorOf>
+      <name>Override Maven HTTP blocker for the Lightwell index</name>
+      <url>http://0.0.0.0/</url>
+      <blocked>false</blocked>
+    </mirror>
+    <mirror>
+      <id>lightwell</id>
+      <name>Lightwell internal Maven index</name>
+      <url>LIGHTWELL_MAVEN_URL</url>
+      <mirrorOf>lightwell</mirrorOf>
+      <blocked>false</blocked>
+    </mirror>
+  </mirrors>
+  <profiles>
+    <profile>
+      <id>demo</id>
+      <repositories>
+        <repository>
+          <id>lightwell</id>
+          <name>Lightwell Maven</name>
+          <url>LIGHTWELL_MAVEN_URL</url>
+          <releases>
+            <enabled>true</enabled>
+          </releases>
+          <snapshots>
+            <enabled>false</enabled>
+          </snapshots>
+        </repository>
+        <repository>
+          <id>redhat-ga</id>
+          <name>Red Hat GA Maven Repository</name>
+          <url>https://maven.repository.redhat.com/ga/</url>
+          <releases>
+            <enabled>true</enabled>
+          </releases>
+          <snapshots>
+            <enabled>false</enabled>
+          </snapshots>
+        </repository>
+      </repositories>
+      <pluginRepositories>
+        <pluginRepository>
+          <id>redhat-ga</id>
+          <name>Red Hat GA Maven Repository</name>
+          <url>https://maven.repository.redhat.com/ga/</url>
+          <releases>
+            <enabled>true</enabled>
+          </releases>
+          <snapshots>
+            <enabled>false</enabled>
+          </snapshots>
+        </pluginRepository>
+      </pluginRepositories>
+    </profile>
+  </profiles>
+  <activeProfiles>
+    <activeProfile>demo</activeProfile>
+  </activeProfiles>
+</settings>

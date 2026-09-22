@@ -1,0 +1,153 @@
+---
+# Event-Driven Ansible as Code
+#
+# Wires CVE disclosure / RHSA / app-fix events to Controller workflows.
+# GitOps PR merge is not an EDA action — Gitea Actions builds from main.
+# Run after the rulebook is on the neuromancer-aws branch in GitHub.
+#
+# ansible-playbook controller/configure_eda.yml --ask-vault-pass
+
+- name: "EDA CaC — Gitea merge webhook"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  vars_files:
+    - ../vars/vault.yml
+  vars:
+    aap_hostname: "{{ vault_controller_host | regex_replace('/$', '') }}"
+    aap_token: "{{ vault_controller_token }}"
+    aap_validate_certs: false
+    demo_org: "Default"
+    eda_project_name: "Lightwell Patch Demo"
+    eda_scm_url: "https://github.com/nmartins0611/lightwell-patch-public.git"
+    eda_scm_branch: "neuromancer-aws"
+    eda_rulebook_name: "cve_lifecycle.yml"
+    eda_source_name: "lightwell_webhook"
+    eda_event_stream_name: "Gitea config-service"
+    eda_hmac_credential_name: "Gitea HMAC"
+    eda_scm_credential_name: "GitHub SCM"
+    eda_aap_credential_name: "AAP Controller"
+    eda_activation_name: "CVE Lifecycle"
+    eda_decision_environment: "Hub Default Decision Environment"
+    gitea_public_url: "http://builder.example.com:3000"
+    gitea_owner: "demo-admin"
+    gitea_repo: "config-service"
+
+  module_defaults:
+    group/ansible.eda.eda:
+      controller_host: "{{ aap_hostname }}"
+      controller_token: "{{ aap_token }}"
+      validate_certs: "{{ aap_validate_certs }}"
+
+  tasks:
+    - name: Create EDA credential — AAP Controller (run job templates)
+      ansible.eda.credential:
+        name: "{{ eda_aap_credential_name }}"
+        description: "Lets rulebook activations launch Controller job templates"
+        credential_type_name: "Red Hat Ansible Automation Platform"
+        organization_name: "{{ demo_org }}"
+        inputs:
+          host: "{{ aap_hostname }}/api/controller/"
+          oauth_token: "{{ aap_token }}"
+          verify_ssl: false
+
+    - name: Create EDA credential — GitHub SCM
+      ansible.eda.credential:
+        name: "{{ eda_scm_credential_name }}"
+        description: "Clone the private demo rulebook repo"
+        credential_type_name: "Source Control"
+        organization_name: "{{ demo_org }}"
+        inputs:
+          username: "{{ vault_github_scm_username }}"
+          password: "{{ vault_github_scm_token }}"
+
+    - name: Create EDA credential — Gitea HMAC
+      ansible.eda.credential:
+        name: "{{ eda_hmac_credential_name }}"
+        description: "HMAC secret for EDA event stream callbacks"
+        credential_type_name: "GitHub Event Stream"
+        organization_name: "{{ demo_org }}"
+        inputs:
+          auth_type: hmac
+          secret: "{{ vault_eda_gitea_webhook_secret }}"
+          hash_algorithm: sha256
+          http_header_key: X-Hub-Signature-256
+          signature_encoding: hex
+          signature_prefix: "sha256="
+
+    - name: Create EDA project from git
+      ansible.eda.project:
+        name: "{{ eda_project_name }}"
+        description: "CVE lifecycle rulebooks"
+        url: "{{ eda_scm_url }}"
+        scm_branch: "{{ eda_scm_branch }}"
+        credential: "{{ eda_scm_credential_name }}"
+        organization_name: "{{ demo_org }}"
+        wait: true
+        sync: true
+
+    - name: Create Gitea event stream
+      ansible.eda.event_stream:
+        name: "{{ eda_event_stream_name }}"
+        credential_name: "{{ eda_hmac_credential_name }}"
+        organization_name: "{{ demo_org }}"
+        headers: "X-Gitea-Event,X-GitHub-Event,X-Gitea-Delivery"
+        forward_events: true
+
+    - name: Look up event stream URL
+      ansible.eda.event_stream_info:
+        name: "{{ eda_event_stream_name }}"
+      register: eda_stream
+
+    - name: Record event stream URL
+      ansible.builtin.set_fact:
+        eda_event_stream_url: "{{ eda_stream.event_streams[0].url }}"
+
+    - name: Create rulebook activation
+      ansible.eda.rulebook_activation:
+        name: "{{ eda_activation_name }}"
+        description: "CVE disclosure, RHSA, app-fix, and app SBOM ingest events"
+        project_name: "{{ eda_project_name }}"
+        rulebook_name: "{{ eda_rulebook_name }}"
+        decision_environment_name: "{{ eda_decision_environment }}"
+        organization_name: "{{ demo_org }}"
+        eda_credentials:
+          - "{{ eda_aap_credential_name }}"
+        event_streams:
+          - event_stream: "{{ eda_event_stream_name }}"
+            source_name: "{{ eda_source_name }}"
+        log_level: info
+        restart_policy: always
+        state: enabled
+
+    - name: List existing Gitea webhooks
+      ansible.builtin.uri:
+        url: "{{ gitea_public_url }}/api/v1/repos/{{ gitea_owner }}/{{ gitea_repo }}/hooks"
+        method: GET
+        user: "{{ gitea_owner }}"
+        password: "{{ vault_gitea_admin_password }}"
+        force_basic_auth: true
+        status_code: [200]
+      register: gitea_hooks
+
+    - name: Remove Gitea webhooks that targeted the EDA event stream
+      ansible.builtin.uri:
+        url: "{{ gitea_public_url }}/api/v1/repos/{{ gitea_owner }}/{{ gitea_repo }}/hooks/{{ item.id }}"
+        method: DELETE
+        user: "{{ gitea_owner }}"
+        password: "{{ vault_gitea_admin_password }}"
+        force_basic_auth: true
+        status_code: [204]
+      loop: "{{ gitea_hooks.json }}"
+      when: item.config.url | default('') == eda_event_stream_url
+      loop_control:
+        label: "{{ item.id }}"
+
+    - name: EDA wiring complete
+      ansible.builtin.debug:
+        msg: |
+          EDA event stream: {{ eda_event_stream_url }}
+          Activation: {{ eda_activation_name }}
+          Demo: launch App GitOps Remediate, merge the PR in Gitea,
+          then watch Gitea Actions build, App SBOM Ingest, and App Deploy.

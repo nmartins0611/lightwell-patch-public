@@ -1,0 +1,108 @@
+---
+# Setup: Deploy Lightwell Maven index on Node 2 (Demo 5)
+#
+# Serves a Maven 2 repository over HTTP so simple-webapp can resolve
+# the Lightwell-published gson fix. Pre-seeded with gson 2.11.0 from
+# Maven Central (same pattern as pypiserver + pyyaml 6.0.2).
+#
+# Port: 8082
+
+- name: "Setup — Deploy Lightwell Maven Index"
+  hosts: builders
+  become: true
+  gather_facts: true
+  vars:
+    maven_image: "docker.io/library/nginx:1.27-alpine"
+    maven_container_name: "lightwell-maven"
+    maven_port: 8082
+    maven_network: "tcnet"
+    maven_repo_dir: "/var/lib/lightwell-maven/repository"
+    maven_nginx_conf: "/var/lib/lightwell-maven/nginx.conf"
+    lightwell_group_path: "com/google/code/gson/gson"
+    lightwell_artifact: "gson"
+    lightwell_fixed_version: "2.11.0"
+    maven_central: "https://repo1.maven.org/maven2"
+
+  tasks:
+    - name: Create Maven repository directories
+      ansible.builtin.file:
+        path: "{{ maven_repo_dir }}/{{ lightwell_group_path }}/{{ lightwell_fixed_version }}"
+        state: directory
+        mode: "0755"
+
+    - name: Install nginx config for the Maven index
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/files/lightwell-maven-nginx.conf"
+        dest: "{{ maven_nginx_conf }}"
+        mode: "0644"
+
+    - name: Download fixed gson JAR from Maven Central
+      ansible.builtin.get_url:
+        url: "{{ maven_central }}/{{ lightwell_group_path }}/{{ lightwell_fixed_version }}/{{ lightwell_artifact }}-{{ lightwell_fixed_version }}.jar"
+        dest: "{{ maven_repo_dir }}/{{ lightwell_group_path }}/{{ lightwell_fixed_version }}/{{ lightwell_artifact }}-{{ lightwell_fixed_version }}.jar"
+        mode: "0644"
+
+    - name: Download fixed gson POM from Maven Central
+      ansible.builtin.get_url:
+        url: "{{ maven_central }}/{{ lightwell_group_path }}/{{ lightwell_fixed_version }}/{{ lightwell_artifact }}-{{ lightwell_fixed_version }}.pom"
+        dest: "{{ maven_repo_dir }}/{{ lightwell_group_path }}/{{ lightwell_fixed_version }}/{{ lightwell_artifact }}-{{ lightwell_fixed_version }}.pom"
+        mode: "0644"
+
+    - name: Write Maven metadata for gson
+      ansible.builtin.copy:
+        dest: "{{ maven_repo_dir }}/{{ lightwell_group_path }}/maven-metadata.xml"
+        mode: "0644"
+        content: |
+          <?xml version="1.0" encoding="UTF-8"?>
+          <metadata>
+            <groupId>com.google.code.gson</groupId>
+            <artifactId>gson</artifactId>
+            <versioning>
+              <latest>{{ lightwell_fixed_version }}</latest>
+              <release>{{ lightwell_fixed_version }}</release>
+              <versions>
+                <version>{{ lightwell_fixed_version }}</version>
+              </versions>
+            </versioning>
+          </metadata>
+
+    - name: Deploy Lightwell Maven nginx container
+      containers.podman.podman_container:
+        name: "{{ maven_container_name }}"
+        image: "{{ maven_image }}"
+        state: started
+        recreate: true
+        network: "{{ maven_network }}"
+        ports:
+          - "{{ maven_port }}:8080"
+        volumes:
+          - "{{ maven_repo_dir }}:/usr/share/nginx/html:z"
+          - "{{ maven_nginx_conf }}:/etc/nginx/conf.d/default.conf:z,ro"
+
+    - name: Wait for Maven index to become ready
+      ansible.builtin.uri:
+        url: "http://localhost:{{ maven_port }}/{{ lightwell_group_path }}/{{ lightwell_fixed_version }}/{{ lightwell_artifact }}-{{ lightwell_fixed_version }}.jar"
+        method: GET
+        status_code: [200]
+      register: maven_health
+      retries: 10
+      delay: 3
+      until: maven_health.status == 200
+
+    - name: Allow Maven index through firewall
+      ansible.posix.firewalld:
+        port: "{{ maven_port }}/tcp"
+        permanent: true
+        immediate: true
+        state: enabled
+
+    - name: Deployment summary
+      ansible.builtin.debug:
+        msg: |
+          === LIGHTWELL MAVEN INDEX DEPLOYED ===
+          URL:     http://{{ ansible_host }}:{{ maven_port }}/
+          Package: com.google.code.gson:gson:{{ lightwell_fixed_version }}
+
+          Usage in settings.xml:
+            <url>http://{{ ansible_host }}:{{ maven_port }}/</url>
+          ======================================

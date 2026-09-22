@@ -2,7 +2,8 @@
 - name: CVE Lifecycle — Lightwell + AAP Demo
   hosts: all
   sources:
-    - ansible.eda.webhook:
+    - name: lightwell_webhook
+      ansible.eda.webhook:
         host: 0.0.0.0
         port: "{{ eda_webhook_port | default(5000) }}"
 
@@ -61,5 +62,24 @@
               affected_library: "{{ event.payload.affected_library }}"
               fixed_version: "{{ event.payload.fixed_version }}"
               app_name: "{{ event.payload.app_name }}"
+              demo_app_name: "{{ event.payload.app_name }}"
               app_repo: "{{ event.payload.app_repo }}"
               target_branch: "{{ event.payload.target_branch }}"
+              dependency_file: "{{ event.payload.dependency_file }}"
+              pin_style: "{{ event.payload.pin_style }}"
+              lightwell_index_url: "{{ event.payload.lightwell_index }}"
+
+    - name: Gitea built the app — ingest SBOM then deploy
+      condition: event.payload.type == "app_sbom_ready"
+      action:
+        run_workflow_template:
+          name: "App Ingest and Deploy"
+          organization: "Default"
+          job_args:
+            extra_vars:
+              demo_app_name: "{{ event.payload.app_name }}"
+              app_image: "{{ event.payload.image }}"
+
+    # Merge of the GitOps PR is the human approval gate. The push to
+    # main then runs Gitea Actions (build.yml). Do not launch App
+    # Container Rebuild here — that duplicates the Gitea build.

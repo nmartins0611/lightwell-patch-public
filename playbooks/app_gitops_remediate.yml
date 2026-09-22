@@ -2,17 +2,17 @@
 # Demo 4b: App Dependency Remediation — GitOps Path (Gitea)
 #
 # Lightwell publishes a fixed library version. This workflow opens a
-# Pull Request in Gitea updating the dependency version. Gitea Actions
-# CI runs automatically. On merge, CD deploys the rebuilt application.
-# Ansible validates post-deploy health.
+# Pull Request in Gitea updating the dependency version. The job stops
+# there — merge in Gitea is the human approval. The resulting push to
+# main runs Gitea Actions, which builds against the Lightwell index
+# (PyPI for Demo 4, Maven for Demo 5).
 #
 # Flow:
 #   Lightwell publishes fix to PyPI index
 #     → Controller opens PR updating dependency version
-#     → Gitea Actions CI runs (build + test + scan)
-#     → PR merged (auto or manual)
-#     → CD deploys the rebuilt application
-#     → Ansible validates post-deploy health
+#     → Human reviews and merges in Gitea (approval gate)
+#     → Gitea Actions builds and tests the patched application
+#     → Gitea writes an app SBOM; EDA launches App Ingest and Deploy
 #
 # Triggered by: EDA (app_dependency_fix_gitops event)
 
@@ -28,14 +28,15 @@
     fixed_version: "{{ demo_app_fixed_version }}"
     app_name: "{{ demo_app_name }}"
     dependency_file: "{{ demo_app_dependency_file }}"
+    pin_style: "{{ demo_app_pin_style | default('pip') }}"
     target_branch: "{{ demo_app_target_branch | default('main') }}"
     gitea_url: "{{ demo_gitea_url }}"
     gitea_api: "{{ demo_gitea_url }}/api/v1"
     gitea_owner: "{{ demo_gitea_owner }}"
-    gitea_repo: "{{ demo_app_name }}"
+    gitea_repo: "{{ app_name }}"
     gitea_token: "{{ vault_gitea_api_token }}"
     lightwell_index_url: "{{ demo_lightwell_pypi_url }}"
-    fix_branch: "security/{{ cve_id | lower }}"
+    fix_branch: "security/{{ affected_library }}-{{ fixed_version }}"
 
   tasks:
     - name: "Phase 1 — Create fix branch and update dependency"
@@ -54,7 +55,7 @@
             status_code: [201, 409]
           register: branch_result
 
-        - name: Read current requirements.txt
+        - name: Read current dependency file
           ansible.builtin.uri:
             url: "{{ gitea_api }}/repos/{{ gitea_owner }}/{{ gitea_repo }}/contents/{{ dependency_file }}?ref={{ fix_branch }}"
             method: GET
@@ -68,9 +69,15 @@
             current_deps: "{{ dep_file.json.content | b64decode }}"
             file_sha: "{{ dep_file.json.sha }}"
 
-        - name: Compute fixed content
+        - name: Compute fixed pip pin
           ansible.builtin.set_fact:
             updated_deps: "{{ current_deps | regex_replace(affected_library + '[=<>~!][^\\n]*', affected_library + '==' + fixed_version) }}"
+          when: pin_style == "pip"
+
+        - name: Compute fixed Maven property
+          ansible.builtin.set_fact:
+            updated_deps: "{{ current_deps | regex_replace('<' + affected_library + '\\.version>[^<]+</' + affected_library + '\\.version>', '<' + affected_library + '.version>' + fixed_version + '</' + affected_library + '.version>') }}"
+          when: pin_style == "maven"
 
         - name: Commit updated dependency to fix branch
           ansible.builtin.uri:
@@ -81,14 +88,15 @@
               Content-Type: "application/json"
             body_format: json
             body:
-              message: "fix(security): update {{ affected_library }} to {{ fixed_version }}\n\nResolves {{ cve_id }} — Lightwell-published fix.\nSource: {{ lightwell_index_url }}"
+              message: "Update {{ affected_library }} to {{ fixed_version }}\n\nLightwell update available for {{ affected_library }}. Rebuild required."
               content: "{{ updated_deps | b64encode }}"
               sha: "{{ file_sha }}"
               branch: "{{ fix_branch }}"
               committer:
                 name: "AAP Security Automation"
                 email: "aap-security@example.com"
-            status_code: [200]
+            status_code: [200, 409]
+          when: current_deps != updated_deps
 
     - name: "Phase 2 — Open Pull Request"
       block:
@@ -101,150 +109,48 @@
               Content-Type: "application/json"
             body_format: json
             body:
-              title: "fix(security): {{ cve_id }} — Update {{ affected_library }} to {{ fixed_version }}"
+              title: "Update {{ affected_library }} to {{ fixed_version }} and rebuild"
               body: |
-                ## Security Remediation (Automated)
+                The package {{ affected_library }} needs to be updated to {{ fixed_version }} and the application rebuilt.
 
-                **CVE:** {{ cve_id }}
-                **Library:** {{ affected_library }}
-                **Fixed Version:** {{ fixed_version }}
-                **Source:** Project Lightwell
+                Lightwell update available for {{ affected_library }}.
 
-                ### What changed
-                Updated `{{ dependency_file }}` to pin `{{ affected_library }}` at version `{{ fixed_version }}`.
-
-                ### Why this is a rebuild, not a patch
-                Application dependencies are **build-time artifacts**. Unlike OS packages
-                where `dnf update` patches a live system, this library is compiled into
-                the application. The fix requires:
-                1. Version pin update (this PR)
-                2. CI/CD rebuild of the application
-                3. Redeployment of the rebuilt artifact
-
-                ---
-                _Opened by AAP Security Automation via Event-Driven Ansible_
+                Merge this PR to pin the new version. Gitea Actions will rebuild from `main` using the Lightwell index.
               head: "{{ fix_branch }}"
               base: "{{ target_branch }}"
-              labels: [0]
-            status_code: [201]
+            status_code: [201, 409]
           register: pr_result
+
+        - name: Find existing open PR if create returned conflict
+          ansible.builtin.uri:
+            url: "{{ gitea_api }}/repos/{{ gitea_owner }}/{{ gitea_repo }}/pulls?state=open"
+            method: GET
+            headers:
+              Authorization: "token {{ gitea_token }}"
+            status_code: [200]
+          register: open_prs
+          when: pr_result.status == 409
 
         - name: Record PR details
           ansible.builtin.set_fact:
-            pr_number: "{{ pr_result.json.number }}"
-            pr_url: "{{ pr_result.json.html_url }}"
+            pr_number: "{{ pr_result.json.number if pr_result.status == 201 else (open_prs.json | selectattr('head.ref', 'equalto', fix_branch) | map(attribute='number') | first) }}"
+            pr_url: "{{ pr_result.json.html_url if pr_result.status == 201 else (open_prs.json | selectattr('head.ref', 'equalto', fix_branch) | map(attribute='html_url') | first) }}"
 
         - name: Display PR
           ansible.builtin.debug:
             msg: |
-              === GITOPS PR OPENED ===
+              === GITOPS PR OPENED — WAITING FOR APPROVAL ===
               PR: {{ pr_url }}
               Branch: {{ fix_branch }} → {{ target_branch }}
-              ========================
+              Package: {{ affected_library }} {{ fixed_version }}
+              Lightwell update available for {{ affected_library }}.
+              Merge this PR in Gitea to rebuild.
+              ============================================================
 
-    - name: "Phase 3 — Wait for CI to pass on the PR"
-      block:
-        - name: Poll PR commit statuses
-          ansible.builtin.uri:
-            url: "{{ gitea_api }}/repos/{{ gitea_owner }}/{{ gitea_repo }}/commits/{{ fix_branch }}/status"
-            method: GET
-            headers:
-              Authorization: "token {{ gitea_token }}"
-            status_code: [200]
-          register: commit_status
-          retries: 30
-          delay: 15
-          until: >-
-            commit_status.json.state | default('pending') in ['success', 'failure', 'error']
-            or (commit_status.json.statuses | default([]) | length == 0 and commit_status.json.state | default('') == '')
-
-        - name: Display CI status
-          ansible.builtin.debug:
-            msg: "CI status: {{ commit_status.json.state | default('no checks configured') }}"
-
-    - name: "Phase 4 — Merge the PR"
-      block:
-        - name: Merge the pull request
-          ansible.builtin.uri:
-            url: "{{ gitea_api }}/repos/{{ gitea_owner }}/{{ gitea_repo }}/pulls/{{ pr_number }}/merge"
-            method: POST
-            headers:
-              Authorization: "token {{ gitea_token }}"
-              Content-Type: "application/json"
-            body_format: json
-            body:
-              Do: "squash"
-              merge_message_field: "fix(security): {{ cve_id }} — {{ affected_library }}=={{ fixed_version }} [Lightwell]"
-              delete_branch_after_merge: true
-            status_code: [200]
-          register: merge_result
-          when: demo_gitops_auto_merge | default(true)
-
-        - name: Display merge status
-          ansible.builtin.debug:
-            msg: |
-              === GITOPS MERGE COMPLETE ===
-              PR #{{ pr_number }} merged to {{ target_branch }}.
-              CD pipeline will now deploy the rebuilt application.
-              =============================
-
-- name: "App Dependency Fix — GitOps Post-Deploy Validation"
-  hosts: targets
-  become: true
-  gather_facts: true
-  vars_files:
-    - ../vars/vault.yml
-  vars:
-    app_name: "{{ demo_app_name }}"
-    cve_id: "{{ demo_app_cve_id }}"
-    affected_library: "{{ demo_app_affected_library }}"
-    fixed_version: "{{ demo_app_fixed_version }}"
-
-  tasks:
-    - name: "Phase 5 — Validate deployment"
-      block:
-        - name: Wait for application to be available
-          ansible.builtin.wait_for:
-            port: "{{ demo_app_port }}"
-            timeout: 120
-            delay: 15
-
-        - name: Post-deploy health check
-          ansible.builtin.uri:
-            url: "http://localhost:{{ demo_app_port }}/health"
-            method: GET
-            status_code: [200]
-          register: health_check
-          retries: 10
-          delay: 10
-
-        - name: Check version endpoint
-          ansible.builtin.uri:
-            url: "http://localhost:{{ demo_app_port }}/version"
-            method: GET
-            status_code: [200]
-          register: version_check
-          failed_when: false
-
-        - name: Display GitOps remediation summary
-          ansible.builtin.debug:
-            msg: |
-              === GITOPS REMEDIATION REPORT ===
-              Host: {{ inventory_hostname }}
-              App: {{ app_name }}
-              CVE: {{ cve_id }}
-              Type: gitops_pr_rebuild
-              PR: {{ hostvars['localhost']['pr_url'] | default('N/A') }}
-              Library: {{ affected_library }}=={{ fixed_version }}
-              Healthy: {{ health_check.status == 200 }}
-              ==================================
-              WORKFLOW SUMMARY:
-              1. Lightwell published fix → internal PyPI
-              2. AAP opened PR in Gitea updating dependency pin
-              3. Gitea Actions built + tested automatically
-              4. Merge triggered CD deployment
-              5. AAP validated service health post-deploy
-              ==================================
-              KEY: No host-level patching occurred.
-              The fix was BUILT INTO the application via CI/CD.
-              ==================================
+        - name: Publish PR details for AO
+          ansible.builtin.set_stats:
+            data:
+              ao_pr_number: "{{ pr_number | string }}"
+              ao_pr_url: "{{ pr_url }}"
+              ao_repo_name: "{{ gitea_repo }}"
+              ao_fix_branch: "{{ fix_branch }}"

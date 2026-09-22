@@ -6,6 +6,9 @@
 # posture (PRE), then applies automated remediation through the
 # cme.controls collection roles.
 #
+# SSH connectivity guard: vars/cme_ssh_guard.yml strips sshd/crypto/firewall
+# and /home-tmpfs mount roles before apply. Do not remove that filter.
+#
 # Triggered by: EDA workflow (after correlate_cve identifies affected hosts)
 
 ###############################################################################
@@ -17,6 +20,7 @@
   gather_facts: true
   vars_files:
     - ../vars/vault.yml
+    - ../vars/cme_ssh_guard.yml
   vars:
     cve_id: "{{ demo_cve_id }}"
     cvss_vector: "{{ demo_cvss_vector }}"
@@ -42,6 +46,26 @@
         cme_dynamic_profile:
           controls: "{{ cme_query_result.cme_ids | map('lower') | map('replace', '-', '_') | list }}"
         cme_dynamic_cme_ids: "{{ cme_query_result.cme_ids }}"
+        cme_ssh_unsafe_cme_ids: "{{ cme_ssh_unsafe_controls | map('regex_replace', '^cme_', 'CME-') | list }}"
+
+    - name: Identify controls that would break SSH
+      ansible.builtin.set_fact:
+        cme_skipped_ssh_unsafe: "{{ cme_dynamic_profile.controls | select('in', cme_ssh_unsafe_controls) | list }}"
+
+    - name: Remove SSH-unsafe controls from apply set
+      ansible.builtin.set_fact:
+        cme_dynamic_profile:
+          controls: "{{ cme_dynamic_profile.controls | difference(cme_ssh_unsafe_controls) }}"
+        cme_dynamic_cme_ids: "{{ cme_dynamic_cme_ids | difference(cme_ssh_unsafe_cme_ids) }}"
+      when: cme_skipped_ssh_unsafe | length > 0
+
+    - name: Display SSH-unsafe controls skipped
+      ansible.builtin.debug:
+        msg: >-
+          Skipping {{ cme_skipped_ssh_unsafe | length }} control(s) that rewrite
+          sshd, crypto policy, or host firewall:
+          {{ cme_skipped_ssh_unsafe | join(', ') }}
+      when: cme_skipped_ssh_unsafe | length > 0
 
     - name: Ensure report directory exists
       ansible.builtin.file:
@@ -73,6 +97,7 @@
   gather_facts: true
   vars_files:
     - ../vars/vault.yml
+    - ../vars/cme_ssh_guard.yml
   vars:
     cme_results: []
 
@@ -111,6 +136,7 @@
   gather_facts: true
   vars_files:
     - ../vars/vault.yml
+    - ../vars/cme_ssh_guard.yml
 
   tasks:
     - name: Load dynamic profile
@@ -151,6 +177,7 @@
           pre_active_controls: "{{ all_pre_active }}"
           profile_controls: "{{ hostvars['localhost']['cme_dynamic_profile']['controls'] }}"
           cme_ids: "{{ hostvars['localhost']['cme_dynamic_cme_ids'] }}"
+          skipped_ssh_unsafe: "{{ hostvars['localhost']['cme_skipped_ssh_unsafe'] | default([]) }}"
           timestamp: "{{ ansible_date_time.iso8601 | default(lookup('pipe', 'date -Iseconds')) }}"
 
     - name: Save PRE state locally
@@ -165,7 +192,8 @@
           ═══════════════════════════════════════════════════════════
             CME MITIGATION COMPLETE — {{ demo_cve_id }}
           ═══════════════════════════════════════════════════════════
-           Controls queried:    {{ hostvars['localhost']['cme_dynamic_cme_ids'] | length }}
+           Controls queried:    {{ (hostvars['localhost']['cme_dynamic_cme_ids'] | length) + (hostvars['localhost']['cme_skipped_ssh_unsafe'] | default([]) | length) }}
+           Skipped (SSH-safe):  {{ hostvars['localhost']['cme_skipped_ssh_unsafe'] | default([]) | length }}
            PRE active:          {{ all_pre_active | length }}
            Remediation applied: {{ hostvars['localhost']['cme_dynamic_profile']['controls'] | length }} roles
           ───────────────────────────────────────────────────────────

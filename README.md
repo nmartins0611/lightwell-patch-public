@@ -1,26 +1,26 @@
-# Lightwell + AAP Patch Demo
+# Lightwell + AAP Patch Demo (AWS / RHEL 10 variant)
 
-Sanitized public copy of a CVE-lifecycle demo across Red Hat Trusted Profile Analyzer (RHTPA), Project Lightwell, and Ansible Automation Platform.
+Sanitized public copy of the AWS lab branch (`neuromancer-aws`). It contains **no live lab credentials, hostnames, instance IDs, or tokens**. Copy `vars/vault.example.yml` to `vars/vault.yml`, fill in your own environment, and encrypt it. Do not commit `vars/vault.yml`.
 
-This repository has **no live lab credentials, hostnames, or tokens**. Copy `vars/vault.example.yml` to `vars/vault.yml`, fill in your own environment, and encrypt it. Do not commit `vars/vault.yml`.
-
-3-demo series showing the complete CVE lifecycle.
+3-demo series showing the complete CVE lifecycle across Red Hat Trusted Profile Analyzer (RHTPA), Project Lightwell, and Ansible Automation Platform.
 
 ## Narrative
 
 A Python CVE is disclosed (no fix yet). AAP identifies exposure instantly via RHTPA, mitigates with compensating controls. Lightwell resolves it upstream. AAP tests in a container, patches VMs under governance, and proves the loop is closed.
 
-**Demo 4** extends this with the *application dependency* scenario — where the vulnerable library is baked into an application (not installed via RPM on a host). The fix goes through CI/CD rebuild, not `dnf update`.
+**Demo 4** extends this with the *application dependency* scenario — where the vulnerable library is baked into a Python application (not installed via RPM on a host). The fix goes through CI/CD rebuild, not `dnf update`.
+
+**Demo 5** is the Maven twin: same GitOps rebuild loop, Quarkus `simple-webapp`, Lightwell Maven index.
 
 ## Two Remediation Models
 
-| | OS Package (Demo 1-3) | App Dependency (Demo 4) |
-|---|---|---|
-| **Where the vuln lives** | RPM on the host filesystem | Library inside application artifact |
-| **How Lightwell publishes fix** | RHSA → dnf repository | Fixed package → internal PyPI/Maven |
-| **How you apply it** | `dnf update` on live system | Rebuild application via CI/CD |
-| **Ansible's role** | Orchestrate patch + verify | Trigger rebuild pipeline + deploy + verify |
-| **When it's fixed** | After package install | After application redeploy |
+| | OS Package (Demo 1-3) | Python app (Demo 4) | Java app (Demo 5) |
+|---|---|---|---|
+| **Where the vuln lives** | RPM on the host filesystem | `pyyaml` inside `config-service` | `gson` inside `simple-webapp` |
+| **How Lightwell publishes fix** | RHSA → dnf repository | Wheel → internal PyPI | JAR → internal Maven |
+| **How you apply it** | `dnf update` on live system | Pin `requirements.txt` + rebuild | Pin `pom.xml` + rebuild |
+| **Ansible's role** | Orchestrate patch + verify | GitOps PR + pipeline + TPA ingest | GitOps PR + pipeline + TPA ingest |
+| **When it's fixed** | After package install | After application redeploy | After application redeploy |
 
 ## Infrastructure
 
@@ -38,6 +38,7 @@ A Python CVE is disclosed (no fix yet). AAP identifies exposure instantly via RH
 | 8000 | CME MCP | Defensive control taxonomy + CVSS attenuation |
 | 8080 | nginx | Report server |
 | 8081 | pypiserver | Lightwell PyPI index |
+| 8082 | nginx | Lightwell Maven index |
 | 8180 | Keycloak | OIDC for RHTPA |
 | 8443 | RHTPA (HTTPS) | SBOM storage + CVE correlation |
 
@@ -54,20 +55,15 @@ ansible-vault encrypt vars/vault.yml
 ```
 
 Required vault variables (see `vars/vault.example.yml`):
-- `vault_ansible_user`
-- `vault_ssh_password`
-- `vault_controller_host`
-- `vault_controller_token`
-- `vault_registry_username`
-- `vault_registry_password`
-- `vault_gitea_admin_password` (Demo 4 — Gitea admin)
-- `vault_gitea_api_token` (Demo 4 — created by deploy_gitea.yml, save to vault after)
-- `vault_keycloak_admin_password`
-- `vault_keycloak_demo_password`
+- `vault_ansible_user` / `vault_ssh_private_key`
+- `vault_controller_host` / `vault_controller_token`
+- `vault_registry_username` / `vault_registry_password`
+- `vault_gitea_admin_password` / `vault_gitea_api_token`
+- `vault_github_scm_username` / `vault_github_scm_token`
+- `vault_eda_gitea_webhook_secret`
+- `vault_keycloak_admin_password` / `vault_keycloak_demo_password`
 - `vault_rhtpa_oidc_client_secret`
-- `vault_pg_admin_password`
-- `vault_pg_db_password`
-- `vault_splunk_host` / `vault_splunk_hec_token` (optional Splunk path)
+- `vault_pg_admin_password` / `vault_pg_db_password`
 
 ### 2. Install collections
 
@@ -90,6 +86,12 @@ ansible-playbook setup/deploy_pypiserver.yml -i inventory/hosts.yml --ask-vault-
 
 # Seed Gitea with the config-service demo app (Demo 4)
 ansible-playbook setup/seed_gitea.yml -i inventory/hosts.yml --ask-vault-pass
+
+# Deploy Lightwell Maven index on Node 2 (Demo 5)
+ansible-playbook setup/deploy_maven_repo.yml -i inventory/hosts.yml --ask-vault-pass
+
+# Seed Gitea with the simple-webapp demo app (Demo 5)
+ansible-playbook setup/seed_gitea_java.yml -i inventory/hosts.yml --ask-vault-pass
 
 # Prepare targets with vulnerable OS package
 ansible-playbook setup/prepare_target.yml -i inventory/hosts.yml --ask-vault-pass
@@ -124,7 +126,10 @@ export EDA_HOST=your-eda-host
 
 # Demo 4: Lightwell resolves app dependency (CI/CD rebuild)
 ./demo/trigger_app_dependency_fix.sh cicd    # Direct CI/CD path
-./demo/trigger_app_dependency_fix.sh gitops  # GitOps PR path
+./demo/trigger_app_dependency_fix.sh gitops  # GitOps PR path (Python / PyPI)
+
+# Demo 5: Lightwell resolves Java/Maven dependency
+./demo/trigger_app_dependency_fix.sh maven   # GitOps PR path (Quarkus / Maven)
 ```
 
 ## Demo Flow
@@ -133,7 +138,7 @@ export EDA_HOST=your-eda-host
 CVE notification → EDA → query RHTPA → map to inventory → exposure report
 
 ### Demo 2: "Compensate While We Wait" (~15 min)
-CME MCP query → recommended-controls report → PRE verify → remediate → POST verify → CVSS attenuation scoring → posture report
+CME MCP query → dynamic control profile → PRE verify → remediate → POST verify → CVSS attenuation scoring → posture report
 
 ### Demo 3: "Lightwell Fixes It — OS Package" (~20 min)
 RHSA notification → container test → staged VM patch → verify → RHTPA updated → controls removed → audit trail
@@ -178,6 +183,23 @@ Lightwell publishes fix to internal PyPI
 
 **Key distinction:** No `dnf update` happens. The fix is *built into* the application artifact via CI/CD. Ansible orchestrates the pipeline, not the package manager.
 
+### Demo 5: "Lightwell Fixes It — Java / Maven" (~25 min)
+
+Same rebuild model as Demo 4. The application is Andrew Block's Quarkus `simple-webapp` (app tree only — not the rolling-release Ansible). Lightwell publishes `gson` 2.11.0 to an internal Maven index on port 8082.
+
+```
+Lightwell publishes gson 2.11.0 to internal Maven
+  → EDA event app_dependency_fix_gitops
+  → Controller opens a PR bumping <gson.version> in pom.xml
+  → Human merges in Gitea
+  → Gitea Actions builds the Containerfile (Maven inside OpenJDK 21)
+  → Syft writes simple-webapp-sbom.json; EDA launches App SBOM Ingest
+```
+
+TPA then holds two pipeline SBOMs: `config-service` (PyPI) and `simple-webapp` (Maven).
+
+Trigger: `./demo/trigger_app_dependency_fix.sh maven`
+
 ## Resetting the Demo
 
 Run between demo sessions to revert everything to pre-demo state:
@@ -192,6 +214,9 @@ ansible-playbook setup/reset_demo.yml -i inventory/hosts.yml --ask-vault-pass --
 # Reset only app dependency demo (4)
 ansible-playbook setup/reset_demo.yml -i inventory/hosts.yml --ask-vault-pass --tags app_dependency
 
+# Reset only Java/Maven demo (5)
+ansible-playbook setup/reset_demo.yml -i inventory/hosts.yml --ask-vault-pass --tags java_app
+
 # Clear reports only
 ansible-playbook setup/reset_demo.yml -i inventory/hosts.yml --ask-vault-pass --tags reports
 ```
@@ -202,7 +227,9 @@ The reset playbook:
 - Stops and removes `config-service` containers from targets
 - Closes open PRs and deletes `security/*` branches in Gitea
 - Reverts `requirements.txt` to `pyyaml==6.0.1`
+- Reverts `simple-webapp` `pom.xml` to `gson` 2.8.9
 - Clears all SBOM artifacts, reports, and build images
+- Wipes TPA then seeds `config-service` and `simple-webapp` baseline SBOMs
 
 ## Products Highlighted
 
@@ -210,7 +237,7 @@ The reset playbook:
 - **Project Lightwell** — Upstream vulnerability resolution (OS packages AND application libraries)
 - **CME** — Defensive control taxonomy, CVE-to-control mapping, CVSS attenuation scoring via MCP
 - **AAP** — Orchestration, EDA, governance, compliance evidence
-- **Gitea** — Git forge with built-in CI/CD (Gitea Actions) for Demo 4
+- **Gitea** — Git forge with built-in CI/CD (Gitea Actions) for Demo 4 and Demo 5
 
 ## Repository Structure
 
@@ -220,8 +247,8 @@ The reset playbook:
 ├── playbooks/               All demo playbooks
 │   ├── sbom_scan_upload.yml           Demo 1 — SBOM baseline
 │   ├── correlate_cve.yml              Demo 1 — CVE correlation
-│   ├── cme_recommend.yml             Demo 2 — Recommended controls report
 │   ├── cme_mitigate.yml               Demo 2 — Compensating controls
+│   ├── cme_recommend.yml              Operator lookup — CVE survey → CME controls
 │   ├── cme_verify.yml                 Demo 2 — Verify controls
 │   ├── container_test.yml             Demo 3 — Container patch test
 │   ├── patch_and_verify.yml           Demo 3 — VM patching (dnf)
@@ -234,19 +261,23 @@ The reset playbook:
 │   ├── deploy_rhtpa.yml               RHTPA server
 │   ├── deploy_gitea.yml               Gitea + act_runner
 │   ├── deploy_pypiserver.yml          Lightwell PyPI index
+│   ├── deploy_maven_repo.yml          Lightwell Maven index (Demo 5)
 │   ├── seed_gitea.yml                 Push config-service to Gitea
+│   ├── seed_gitea_java.yml            Push simple-webapp to Gitea
 │   ├── deploy_report_server.yml       nginx report server
 │   ├── prepare_target.yml             Target node prep
 │   ├── prepare_builder.yml            Builder node prep
 │   └── reset_demo.yml                 Full demo reset
 ├── controller/              Controller configuration as code
 ├── demo/                    Trigger scripts and mock data
-│   ├── config-service/                Sample app (pushed to Gitea)
+│   ├── config-service/                Sample Python app (pushed to Gitea)
+│   ├── simple-webapp/                 Sample Quarkus app (Demo 5)
 │   ├── mock_cve_data.json             OS CVE scenario
-│   ├── mock_app_dependency_cve.json   App dependency scenario
+│   ├── mock_app_dependency_cve.json   App dependency scenario (Python)
+│   ├── mock_java_app_cve.json         App dependency scenario (Java)
 │   ├── trigger_cve_disclosure.sh      Demo 1+2 trigger
 │   ├── trigger_rhsa_available.sh      Demo 3 trigger
-│   └── trigger_app_dependency_fix.sh  Demo 4 trigger (cicd|gitops)
+│   └── trigger_app_dependency_fix.sh  Demo 4/5 trigger (cicd|gitops|maven)
 ├── execution-environment/   EE build definition
 └── collections/             Required collections manifest
 ```

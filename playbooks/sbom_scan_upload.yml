@@ -13,7 +13,7 @@
     - ../vars/vault.yml
   vars:
     sbom_format: "cyclonedx-json@1.6"
-    sbom_output: "{{ sbom_output_dir }}/{{ ansible_host }}-sbom.json"
+    sbom_output: "{{ sbom_output_dir }}/{{ inventory_hostname }}-sbom.json"
 
   tasks:
     - name: Ensure output directory exists
@@ -22,11 +22,11 @@
         state: directory
         mode: "0750"
 
-    - name: Run Syft SBOM scan (Python packages)
+    - name: Run Syft SBOM scan (system packages)
       ansible.builtin.command:
         cmd: >-
-          syft scan dir:/usr/lib64/python3.9
-          --source-name {{ ansible_host }}
+          syft scan dir:/
+          --source-name {{ inventory_hostname }}
           --output {{ sbom_format }}={{ sbom_output }}
       changed_when: true
 
@@ -103,7 +103,7 @@
       ansible.builtin.uri:
         url: "{{ rhtpa_api_endpoint }}/api/v2/advisory"
         method: POST
-        src: "{{ playbook_dir }}/../demo/mock_vex_cve-2026-51234.json"
+        src: "{{ playbook_dir }}/../demo/mock_vex_cve-2026-31419.json"
         headers:
           Content-Type: "application/json"
           Authorization: "Bearer {{ token_response.json.access_token }}"
@@ -115,6 +115,6 @@
     - name: Advisory upload status
       ansible.builtin.debug:
         msg: >-
-          {{ 'Advisory RHSA-2026:4521 uploaded to RHTPA'
+          {{ 'Advisory RHSA-2026:25191 uploaded to RHTPA'
              if advisory_upload is changed else
              'Advisory already present in RHTPA (' ~ advisory_check.json.total ~ ' advisories)' }}

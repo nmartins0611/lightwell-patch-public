@@ -8,6 +8,7 @@
 # Port allocations on node2:
 #   3000 — Gitea web UI + API + Git HTTP
 #   8081 — pypiserver (Lightwell PyPI index)
+#   8082 — nginx Maven index (Lightwell, Demo 5)
 #   8180 — Keycloak
 #   8090 — RHTPA API
 #   8080 — nginx report server
@@ -66,6 +67,10 @@
               GITEA__api__ENABLE_SWAGGER: "true"
               GITEA__packages__ENABLED: "true"
               GITEA__install__INSTALL_LOCK: "true"
+              # SSRF allowlist: replace with your AAP host if you tighten this.
+              GITEA__webhook__ALLOWED_HOST_LIST: "*"
+              GITEA__webhook__SKIP_TLS_VERIFY: "true"
+              GITEA__security__ALLOWED_HOST_LIST: "*"
           register: gitea_container
 
         - name: Wait for Gitea HTTP to respond
@@ -197,12 +202,14 @@
                   - "ubuntu-latest:docker://node:20-bookworm"
                   - "python:docker://python:3.11-slim"
                   - "default:docker://python:3.11-slim"
+                  - "docker:docker://docker:24-cli"
               container:
                 network: "{{ gitea_network }}"
-                privileged: false
+                privileged: true
                 options: ""
                 valid_volumes:
                   - "/tmp/lightwell-pypi/**"
+                  - "/tmp/sbom-artifacts/**"
             dest: /tmp/gitea-runner-config.yaml
             mode: "0644"
 

@@ -1,8 +1,8 @@
 ---
 # Setup: Prepare Target Node
 #
-# Installs the vulnerable version of python-cryptography on Node 1
-# and ensures scanning prerequisites are met.
+# Verifies the target kernel is at the vulnerable version and
+# ensures scanning prerequisites are met for the demo.
 
 - name: "Setup — Prepare Target Node for Demo"
   hosts: targets
@@ -10,20 +10,26 @@
   gather_facts: true
 
   tasks:
-    - name: Install python-cryptography (demo vulnerable version)
-      ansible.builtin.dnf:
-        name: "python3-cryptography"
-        state: present
-
-    - name: Verify vulnerable version installed
+    - name: Verify kernel version (should be vulnerable baseline)
       ansible.builtin.command:
-        cmd: rpm -q python3-cryptography
-      register: pkg_check
+        cmd: uname -r
+      register: kernel_check
       changed_when: false
 
-    - name: Display installed version
+    - name: Display current kernel version
       ansible.builtin.debug:
-        msg: "Target prepared: {{ pkg_check.stdout }}"
+        msg: "Target kernel: {{ kernel_check.stdout }} (expected: {{ demo_cve_vulnerable_version }})"
+
+    - name: Confirm kernel is at vulnerable baseline
+      ansible.builtin.assert:
+        that:
+          - demo_cve_vulnerable_version in kernel_check.stdout
+        fail_msg: >-
+          Kernel is not at the expected vulnerable version.
+          Running: {{ kernel_check.stdout }}
+          Expected: {{ demo_cve_vulnerable_version }}
+          Restore from AMI snapshot if needed.
+        success_msg: "Kernel at expected vulnerable version — demo ready"
 
     - name: Install Syft for SBOM generation
       ansible.builtin.get_url:
@@ -45,6 +51,11 @@
         - "{{ sbom_output_dir }}"
         - "{{ report_output_dir }}"
         - "/var/lib/cme"
+
+    - name: Install firewalld (if not present)
+      ansible.builtin.dnf:
+        name: firewalld
+        state: present
 
     - name: Ensure firewalld is running (for CME mitigations)
       ansible.builtin.systemd:

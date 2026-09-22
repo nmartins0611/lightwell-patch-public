@@ -6,3 +6,4 @@ collections:
   - name: community.general
   - name: ansible.posix
   - name: containers.podman
+  - name: amazon.aws

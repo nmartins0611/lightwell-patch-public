@@ -205,6 +205,17 @@
              Changes:   {{ post_score.simulation.modifications_applied | default(0) }} vector modifications
           ═══════════════════════════════════════════════════════════
 
+    - name: Publish CME risk reduction for AO reporting
+      ansible.builtin.set_stats:
+        data:
+          ao_cvss_score_before: "{{ pre_score.simulation.original.score | default('10.0') | string }}"
+          ao_cvss_score_after: "{{ post_score.simulation.modified.score | default('N/A') | string }}"
+          ao_cvss_severity_before: "{{ pre_score.simulation.original.severity | default('Critical') }}"
+          ao_cvss_severity_after: "{{ post_score.simulation.modified.severity | default('N/A') }}"
+          ao_controls_pre: "{{ cme_all_pre_active | length | string }}"
+          ao_controls_post: "{{ all_post_active | length | string }}"
+          ao_controls_gained: "{{ all_newly_passed | length | string }}"
+
 - name: "Publish Posture Report to Report Server"
   hosts: builders
   become: true

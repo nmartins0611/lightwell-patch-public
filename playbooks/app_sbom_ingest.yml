@@ -1,0 +1,96 @@
+---
+# Demo 4/5: Ingest the Gitea-produced app SBOM into RHTPA
+#
+# Gitea Actions builds the image and writes CycloneDX to
+# /tmp/sbom-artifacts/app on the builder. This playbook POSTs that
+# document to TPA. It does not scan hosts and must not replace fleet SBOMs.
+#
+# Triggered by: EDA (app_sbom_ready) after Gitea Actions succeeds.
+
+- name: "App SBOM Ingest — Collect Gitea CycloneDX"
+  hosts: builders
+  become: true
+  gather_facts: false
+  vars_files:
+    - ../vars/vault.yml
+  vars:
+    app_sbom_file: "{{ demo_app_sbom_dir | default('/tmp/sbom-artifacts/app') }}/{{ demo_app_name | default('config-service') }}-sbom.json"
+
+  tasks:
+    - name: Require Gitea-produced app SBOM
+      ansible.builtin.stat:
+        path: "{{ app_sbom_file }}"
+      register: app_sbom
+
+    - name: Fail if Gitea has not written the SBOM
+      ansible.builtin.assert:
+        that:
+          - app_sbom.stat.exists
+          - app_sbom.stat.size | int > 0
+        fail_msg: >-
+          No app SBOM at {{ app_sbom_file }}.
+          Reset seeds the baseline, or Gitea Actions writes it after a merge.
+
+    - name: Fetch app SBOM to controller
+      ansible.builtin.fetch:
+        src: "{{ app_sbom_file }}"
+        dest: "{{ sbom_output_dir }}/app/"
+        flat: true
+
+- name: "App SBOM Ingest — Upload to RHTPA"
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: false
+  vars_files:
+    - ../vars/vault.yml
+  vars:
+    ansible_become: false
+    app_name: "{{ demo_app_name | default('config-service') }}"
+    fetched_sbom: "{{ (sbom_output_dir | default('/tmp/sbom-artifacts')) }}/app/{{ demo_app_name | default('config-service') }}-sbom.json"
+
+  tasks:
+    - name: Acquire OIDC token from Keycloak
+      ansible.builtin.uri:
+        url: "{{ rhtpa_keycloak_url }}/realms/{{ rhtpa_keycloak_realm }}/protocol/openid-connect/token"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          client_id: "{{ rhtpa_oidc_client_id }}"
+          client_secret: "{{ rhtpa_oidc_client_secret }}"
+          grant_type: "client_credentials"
+          scope: "openid create:document read:document"
+        status_code: [200]
+        validate_certs: false
+      register: token_response
+
+    - name: Upload app SBOM to RHTPA
+      ansible.builtin.uri:
+        url: "{{ rhtpa_sbom_endpoint }}"
+        method: POST
+        src: "{{ fetched_sbom }}"
+        headers:
+          Content-Type: "application/json"
+          Accept: "application/json"
+          Authorization: "Bearer {{ token_response.json.access_token }}"
+        status_code: [200, 201, 202]
+        timeout: 120
+        validate_certs: false
+      register: upload_result
+
+    - name: Confirm TPA stored the app SBOM
+      ansible.builtin.uri:
+        url: "{{ rhtpa_api_endpoint }}/api/v2/sbom?q={{ app_name }}"
+        method: GET
+        headers:
+          Accept: "application/json"
+          Authorization: "Bearer {{ token_response.json.access_token }}"
+        status_code: [200]
+        validate_certs: false
+      register: tpa_lookup
+
+    - name: Display ingest result
+      ansible.builtin.debug:
+        msg: |
+          Uploaded {{ fetched_sbom }} to RHTPA (HTTP {{ upload_result.status }}).
+          TPA query for {{ app_name }}: {{ tpa_lookup.json.total | default(0) }} document(s).

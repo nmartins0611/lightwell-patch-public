@@ -1,0 +1,266 @@
+---
+# Create App Deploy JT and App Ingest and Deploy workflow.
+# Keeps the Controller project on neuromancer-aws. Does not sync inventory.
+# Also refreshes the EDA project and CVE Lifecycle activation so
+# app_sbom_ready launches the new workflow.
+#
+# ansible-playbook controller/configure_app_deploy.yml --ask-vault-pass
+
+- name: "Controller CaC — App Ingest and Deploy"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  vars_files:
+    - ../vars/vault.yml
+  vars:
+    controller_host: "{{ vault_controller_host }}"
+    controller_oauthtoken: "{{ vault_controller_token }}"
+    controller_validate_certs: false
+    demo_org: "Default"
+    demo_project: "Lightwell Patch Demo"
+    demo_inventory: "Demo Fleet"
+    demo_credential: "Demo Machine Credential"
+    demo_scm_branch: "neuromancer-aws"
+    eda_project_name: "Lightwell Patch Demo"
+    eda_scm_url: "https://github.com/nmartins0611/lightwell-patch-public.git"
+    eda_scm_branch: "neuromancer-aws"
+    eda_rulebook_name: "cve_lifecycle.yml"
+    eda_source_name: "lightwell_webhook"
+    eda_event_stream_name: "Gitea config-service"
+    eda_scm_credential_name: "GitHub SCM"
+    eda_aap_credential_name: "AAP Controller"
+    eda_activation_name: "CVE Lifecycle"
+    eda_decision_environment: "Hub Default Decision Environment"
+
+  module_defaults:
+    group/ansible.eda.eda:
+      controller_host: "{{ controller_host | regex_replace('/$', '') }}"
+      controller_token: "{{ controller_oauthtoken }}"
+      validate_certs: "{{ controller_validate_certs }}"
+
+  tasks:
+    - name: Keep Controller project on neuromancer-aws and sync
+      ansible.controller.project:
+        name: "{{ demo_project }}"
+        organization: "{{ demo_org }}"
+        scm_branch: "{{ demo_scm_branch }}"
+        update_project: true
+        wait: true
+        controller_host: "{{ controller_host }}"
+        controller_oauthtoken: "{{ controller_oauthtoken }}"
+        validate_certs: "{{ controller_validate_certs }}"
+
+    - name: Look up App Container Rebuild execution environment
+      ansible.builtin.uri:
+        url: "{{ controller_host | regex_replace('/$', '') }}/api/controller/v2/job_templates/?name=App%20Container%20Rebuild"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ controller_oauthtoken }}"
+          Accept: "application/json"
+        status_code:
+          - 200
+        validate_certs: "{{ controller_validate_certs }}"
+      register: rebuild_lookup
+
+    - name: Set execution environment from App Container Rebuild
+      ansible.builtin.set_fact:
+        app_deploy_ee: "{{ rebuild_lookup.json.results[0].summary_fields.execution_environment.name }}"
+      when:
+        - (rebuild_lookup.json.results | length) > 0
+        - rebuild_lookup.json.results[0].summary_fields.execution_environment is defined
+        - rebuild_lookup.json.results[0].summary_fields.execution_environment.name | length > 0
+
+    - name: Require an execution environment with podman
+      ansible.builtin.assert:
+        that:
+          - app_deploy_ee is defined
+          - (app_deploy_ee | length) > 0
+        fail_msg: >-
+          App Container Rebuild has no execution environment.
+          App Deploy needs that EE for the podman collection.
+
+    - name: Create JT — App Deploy
+      ansible.controller.job_template:
+        name: "App Deploy"
+        description: >-
+          Roll the Gitea-built image onto the fleet. Does not rebuild.
+        organization: "{{ demo_org }}"
+        project: "{{ demo_project }}"
+        playbook: "playbooks/app_deploy.yml"
+        inventory: "{{ demo_inventory }}"
+        credentials:
+          - "{{ demo_credential }}"
+        ask_variables_on_launch: false
+        execution_environment: "{{ app_deploy_ee }}"
+        controller_host: "{{ controller_host }}"
+        controller_oauthtoken: "{{ controller_oauthtoken }}"
+        validate_certs: "{{ controller_validate_certs }}"
+
+    - name: Create Workflow — App Ingest and Deploy
+      ansible.controller.workflow_job_template:
+        name: "App Ingest and Deploy"
+        organization: "{{ demo_org }}"
+        inventory: "{{ demo_inventory }}"
+        ask_variables_on_launch: true
+        controller_host: "{{ controller_host }}"
+        controller_oauthtoken: "{{ controller_oauthtoken }}"
+        validate_certs: "{{ controller_validate_certs }}"
+
+    - name: "Workflow node: App SBOM Ingest"
+      ansible.controller.workflow_job_template_node:
+        workflow_job_template: "App Ingest and Deploy"
+        identifier: "app_sbom_ingest"
+        unified_job_template: "App SBOM Ingest"
+        controller_host: "{{ controller_host }}"
+        controller_oauthtoken: "{{ controller_oauthtoken }}"
+        validate_certs: "{{ controller_validate_certs }}"
+
+    - name: "Workflow node: App Deploy (on success)"
+      ansible.controller.workflow_job_template_node:
+        workflow_job_template: "App Ingest and Deploy"
+        identifier: "app_deploy"
+        unified_job_template: "App Deploy"
+        controller_host: "{{ controller_host }}"
+        controller_oauthtoken: "{{ controller_oauthtoken }}"
+        validate_certs: "{{ controller_validate_certs }}"
+
+    - name: Create JT — App Deploy Report
+      ansible.controller.job_template:
+        name: "App Deploy Report"
+        description: >-
+          Verify fleet health after App Deploy and publish the audit report.
+        organization: "{{ demo_org }}"
+        project: "{{ demo_project }}"
+        playbook: "playbooks/app_deploy_report.yml"
+        inventory: "{{ demo_inventory }}"
+        credentials:
+          - "{{ demo_credential }}"
+          - "Vault"
+        ask_variables_on_launch: false
+        controller_host: "{{ controller_host }}"
+        controller_oauthtoken: "{{ controller_oauthtoken }}"
+        validate_certs: "{{ controller_validate_certs }}"
+
+    - name: "Workflow node: App Deploy Report (on success)"
+      ansible.controller.workflow_job_template_node:
+        workflow_job_template: "App Ingest and Deploy"
+        identifier: "app_deploy_report"
+        unified_job_template: "App Deploy Report"
+        controller_host: "{{ controller_host }}"
+        controller_oauthtoken: "{{ controller_oauthtoken }}"
+        validate_certs: "{{ controller_validate_certs }}"
+
+    - name: Look up App Ingest and Deploy workflow
+      ansible.builtin.uri:
+        url: "{{ controller_host | regex_replace('/$', '') }}/api/controller/v2/workflow_job_templates/?name=App%20Ingest%20and%20Deploy"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ controller_oauthtoken }}"
+          Accept: "application/json"
+        status_code:
+          - 200
+        validate_certs: "{{ controller_validate_certs }}"
+      register: ingest_wf_lookup
+
+    - name: Look up workflow nodes
+      ansible.builtin.uri:
+        url: "{{ controller_host | regex_replace('/$', '') }}/api/controller/v2/workflow_job_templates/{{ ingest_wf_lookup.json.results[0].id }}/workflow_nodes/?page_size=20"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ controller_oauthtoken }}"
+          Accept: "application/json"
+        status_code:
+          - 200
+        validate_certs: "{{ controller_validate_certs }}"
+      register: ingest_wf_nodes
+
+    - name: Map workflow node ids by identifier
+      ansible.builtin.set_fact:
+        ingest_wf_node_ids: "{{ dict(ingest_wf_nodes.json.results | map(attribute='identifier') | zip(ingest_wf_nodes.json.results | map(attribute='id'))) }}"
+
+    - name: Disassociate inverted success edges
+      ansible.builtin.uri:
+        url: "{{ controller_host | regex_replace('/$', '') }}/api/controller/v2/workflow_job_template_nodes/{{ item.parent }}/success_nodes/"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ controller_oauthtoken }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          id: "{{ item.child }}"
+          disassociate: true
+        status_code:
+          - 204
+          - 200
+          - 400
+        validate_certs: "{{ controller_validate_certs }}"
+      loop:
+        - parent: "{{ ingest_wf_node_ids.app_deploy_report }}"
+          child: "{{ ingest_wf_node_ids.app_deploy }}"
+        - parent: "{{ ingest_wf_node_ids.app_deploy }}"
+          child: "{{ ingest_wf_node_ids.app_sbom_ingest }}"
+      loop_control:
+        label: "{{ item.parent }} -/-> {{ item.child }}"
+
+    - name: Associate ingest then deploy then report
+      ansible.builtin.uri:
+        url: "{{ controller_host | regex_replace('/$', '') }}/api/controller/v2/workflow_job_template_nodes/{{ item.parent }}/success_nodes/"
+        method: POST
+        headers:
+          Authorization: "Bearer {{ controller_oauthtoken }}"
+          Content-Type: "application/json"
+        body_format: json
+        body:
+          id: "{{ item.child }}"
+        status_code:
+          - 204
+          - 200
+        validate_certs: "{{ controller_validate_certs }}"
+      loop:
+        - parent: "{{ ingest_wf_node_ids.app_sbom_ingest }}"
+          child: "{{ ingest_wf_node_ids.app_deploy }}"
+        - parent: "{{ ingest_wf_node_ids.app_deploy }}"
+          child: "{{ ingest_wf_node_ids.app_deploy_report }}"
+      loop_control:
+        label: "{{ item.parent }} --> {{ item.child }}"
+
+    - name: Sync EDA project so the rulebook change is live
+      ansible.eda.project:
+        name: "{{ eda_project_name }}"
+        description: "CVE lifecycle rulebooks"
+        url: "{{ eda_scm_url }}"
+        scm_branch: "{{ eda_scm_branch }}"
+        credential: "{{ eda_scm_credential_name }}"
+        organization_name: "{{ demo_org }}"
+        wait: true
+        sync: true
+      tags:
+        - eda
+
+    - name: Restart CVE Lifecycle activation with the new rule
+      ansible.eda.rulebook_activation:
+        name: "{{ eda_activation_name }}"
+        description: "CVE disclosure, RHSA, app-fix, ingest, and app deploy events"
+        project_name: "{{ eda_project_name }}"
+        rulebook_name: "{{ eda_rulebook_name }}"
+        decision_environment_name: "{{ eda_decision_environment }}"
+        organization_name: "{{ demo_org }}"
+        eda_credentials:
+          - "{{ eda_aap_credential_name }}"
+        event_streams:
+          - event_stream: "{{ eda_event_stream_name }}"
+            source_name: "{{ eda_source_name }}"
+        log_level: info
+        restart_policy: always
+        state: present
+      tags:
+        - eda
+
+    - name: App Ingest and Deploy wiring complete
+      ansible.builtin.debug:
+        msg: |
+          Job template: App Deploy + App Deploy Report
+          Workflow: App Ingest and Deploy (ingest → deploy → report)
+          EDA: app_sbom_ready launches that workflow
+          Inventory was not synced.

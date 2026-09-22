@@ -1,16 +1,18 @@
 ---
 # =============================================================================
-# Demo 1-3: OS-Level CVE (RPM patching via dnf)
+# Demo 1-3: OS-Level CVE (kernel patching via dnf)
 # =============================================================================
-demo_cve_id: "CVE-2026-51234"
-demo_cve_package: "python-cryptography"
-demo_cve_vulnerable_version: "36.0.1-5.el9_6"
-demo_cve_fixed_version: "36.0.1-6.el9_6"
-demo_advisory_id: "RHSA-2026:4521"
-demo_cvss_vector: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H"
+demo_cve_id: "CVE-2026-31419"
+demo_cve_package: "kernel"
+demo_cve_vulnerable_version: "6.12.0-211.16.1.el10_2"
+# TPA by-package is an exact PURL match. Syft emits arch/distro/upstream
+# qualifiers; the version-only PURL returns zero SBOMs.
+demo_cve_vulnerable_purl: "pkg:rpm/redhat/kernel-core@{{ demo_cve_vulnerable_version }}?arch=x86_64&distro=rhel-10.2&upstream=kernel-{{ demo_cve_vulnerable_version }}.src.rpm"
+demo_cve_fixed_version: "6.12.0-211.22.1.el10_2"
+demo_advisory_id: "RHSA-2026:25191"
+demo_cvss_vector: "CVSS:3.1/AV:L/AC:H/PR:L/UI:N/S:U/C:H/I:H/A:H"
 demo_cwe_ids:
-  - "CWE-119"
-  - "CWE-787"
+  - "CWE-416"
 
 # =============================================================================
 # Demo 4: App Dependency CVE (CI/CD rebuild via Lightwell)
@@ -20,24 +22,56 @@ demo_cwe_ids:
 # are baked into the application. Remediation goes through CI/CD.
 # =============================================================================
 demo_app_cve_id: "CVE-2026-52891"
+demo_app_cvss_vector: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+demo_app_cwe_ids:
+  - "CWE-502"
 demo_app_affected_library: "pyyaml"
 demo_app_affected_versions: "< 6.0.2"
 demo_app_fixed_version: "6.0.2"
 demo_app_advisory_id: "RHSA-2026:4890"
 demo_app_name: "config-service"
 demo_app_dependency_file: "requirements.txt"
+demo_app_pin_style: "pip"
 demo_app_target_branch: "main"
 demo_app_port: 8090
 demo_app_image_registry: "localhost/config-service"
+demo_app_sbom_dir: "/tmp/sbom-artifacts/app"
+demo_app_sbom_file: "{{ demo_app_sbom_dir }}/{{ demo_app_name }}-sbom.json"
 
 # Gitea (deployed on node2 via setup/deploy_gitea.yml)
 demo_gitea_url: "http://{{ hostvars['node2']['ansible_host'] }}:3000"
 demo_gitea_owner: "demo-admin"
-demo_gitops_auto_merge: true
+# Human merges the GitOps PR in Gitea. The push to main runs Gitea
+# Actions. Do not auto-merge from Controller.
+demo_gitops_auto_merge: false
 gitea_port: 3000
+eda_gitea_event_stream: "Gitea config-service"
+eda_event_stream_url: "https://aap.example.com/eda-event-streams/api/eda/v1/external_event_stream/REPLACE_WITH_YOUR_STREAM_ID/post/"
 
 # Lightwell PyPI index (deployed on node2 via setup/deploy_pypiserver.yml)
 demo_lightwell_pypi_url: "http://{{ hostvars['node2']['ansible_host'] }}:8081/simple/"
+
+# =============================================================================
+# Demo 5: Java / Maven app dependency (Quarkus simple-webapp)
+#
+# Same GitOps rebuild model as Demo 4. Different ecosystem: pom.xml +
+# internal Maven index instead of requirements.txt + PyPI.
+# =============================================================================
+demo_java_cve_id: "CVE-2026-61002"
+demo_java_cvss_vector: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N"
+demo_java_cwe_ids:
+  - "CWE-502"
+demo_java_affected_library: "gson"
+demo_java_affected_versions: "< 2.11.0"
+demo_java_fixed_version: "2.11.0"
+demo_java_advisory_id: "RHSA-2026:6100"
+demo_java_app_name: "simple-webapp"
+demo_java_dependency_file: "pom.xml"
+demo_java_pin_style: "maven"
+demo_java_port: 8091
+demo_java_image_registry: "localhost/simple-webapp"
+demo_java_sbom_file: "{{ demo_app_sbom_dir }}/{{ demo_java_app_name }}-sbom.json"
+demo_lightwell_maven_url: "http://{{ hostvars['node2']['ansible_host'] }}:8082/"
 
 # =============================================================================
 # RHTPA Configuration
@@ -45,7 +79,7 @@ demo_lightwell_pypi_url: "http://{{ hostvars['node2']['ansible_host'] }}:8081/si
 rhtpa_api_endpoint: "https://{{ hostvars['node2']['ansible_host'] }}:8443"
 rhtpa_sbom_endpoint: "{{ rhtpa_api_endpoint }}/api/v2/sbom"
 rhtpa_vex_endpoint: "{{ rhtpa_api_endpoint }}/api/v2/vex"
-rhtpa_keycloak_url: "http://{{ hostvars['node2']['ansible_host'] }}:8180"
+rhtpa_keycloak_url: "https://{{ hostvars['node2']['ansible_host'] }}:8180"
 rhtpa_keycloak_realm: "trustification"
 rhtpa_oidc_client_id: "walker"
 rhtpa_oidc_client_secret: "{{ vault_rhtpa_oidc_client_secret }}"
@@ -56,15 +90,29 @@ rhtpa_oidc_client_secret: "{{ vault_rhtpa_oidc_client_secret }}"
 cme_mcp_endpoint: "http://{{ hostvars['node2']['ansible_host'] }}:8000"
 
 # =============================================================================
+# ServiceNow ITSM Integration (optional)
+# =============================================================================
+snow_enabled: false
+snow_instance_host: "https://your-instance.service-now.com"
+snow_caller_id: "Ansible Automation Platform"
+snow_assignment_group: "Security Operations"
+snow_cmdb_class: "cmdb_ci_linux_server"
+
+# =============================================================================
+# Notification Webhooks (SOC alerting)
+# =============================================================================
+notification_webhook_url: "https://hooks.example.com/cve-lifecycle"
+
+# =============================================================================
 # General
 # =============================================================================
 eda_webhook_port: 5000
 splunk_eda_webhook_port: 5001
 
-# Splunk (external SIEM integration — set in vault)
-splunk_host: "{{ vault_splunk_host }}"
+# Splunk (external SIEM integration — disabled for AWS environment)
+splunk_host: ""
 splunk_hec_port: 8088
-splunk_hec_token: "{{ vault_splunk_hec_token }}"
+splunk_hec_token: ""
 
 sbom_output_dir: "/tmp/sbom-artifacts"
 report_output_dir: "/tmp/demo-reports"

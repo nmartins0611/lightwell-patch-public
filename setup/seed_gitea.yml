@@ -81,6 +81,30 @@
         status_code: [200]
       register: repo_contents
 
+    - name: Create Gitea Actions secret for EDA HMAC
+      ansible.builtin.uri:
+        url: "{{ gitea_url }}/api/v1/repos/{{ gitea_admin_user }}/{{ app_repo_name }}/actions/secrets/EDA_WEBHOOK_SECRET"
+        method: PUT
+        user: "{{ gitea_admin_user }}"
+        password: "{{ gitea_admin_password }}"
+        force_basic_auth: true
+        body_format: json
+        body:
+          data: "{{ vault_eda_gitea_webhook_secret }}"
+        status_code: [201, 204]
+
+    - name: Create Gitea Actions variable for EDA event stream URL
+      ansible.builtin.uri:
+        url: "{{ gitea_url }}/api/v1/repos/{{ gitea_admin_user }}/{{ app_repo_name }}/actions/variables/EDA_EVENT_STREAM_URL"
+        method: POST
+        user: "{{ gitea_admin_user }}"
+        password: "{{ gitea_admin_password }}"
+        force_basic_auth: true
+        body_format: json
+        body:
+          value: "{{ eda_event_stream_url }}"
+        status_code: [201, 204, 409]
+
     - name: Display seed result
       ansible.builtin.debug:
         msg: |

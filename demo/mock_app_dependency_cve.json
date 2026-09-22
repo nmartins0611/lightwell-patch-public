@@ -24,7 +24,7 @@
   "affected_applications": [
     {
       "name": "config-service",
-      "repo": "https://gitea.example.com/demo-admin/config-service",
+      "repo": "https://gitea.example.com/apps/config-service",
       "dependency_file": "requirements.txt",
       "dependency_line": "pyyaml==6.0.1",
       "deployment_type": "container",

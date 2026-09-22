@@ -1,17 +1,16 @@
 #!/bin/bash
 set -euo pipefail
 
-KC_URL="http://localhost:8180"
+KC_URL="${KC_URL:-http://localhost:8180}"
 KC_REALM="trustification"
-KC_ADMIN_USER="${KC_ADMIN_USER:?Set KC_ADMIN_USER}"
 KC_ADMIN_PASSWORD="${KC_ADMIN_PASSWORD:?Set KC_ADMIN_PASSWORD}"
-OIDC_CLIENT_SECRET="${OIDC_CLIENT_SECRET:?Set OIDC_CLIENT_SECRET}"
+KC_SERVICE_SECRET="${KC_SERVICE_SECRET:?Set KC_SERVICE_SECRET}"
 
 echo "Getting admin token..."
 TOKEN=$(curl -sf -X POST "$KC_URL/realms/master/protocol/openid-connect/token" \
   -d "client_id=admin-cli" \
-  -d "username=${KC_ADMIN_USER}" \
-  -d "password=${KC_ADMIN_PASSWORD}" \
+  -d "username=admin" \
+  -d "password=$KC_ADMIN_PASSWORD" \
   -d "grant_type=password" | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
 
 if [ -z "$TOKEN" ]; then
@@ -95,7 +94,7 @@ echo ""
 echo "=== Verify: get token with scopes ==="
 SVC_TOKEN=$(curl -sf -X POST "$KC_URL/realms/$KC_REALM/protocol/openid-connect/token" \
   -d "client_id=walker" \
-  -d "client_secret=${OIDC_CLIENT_SECRET}" \
+  -d "client_secret=$KC_SERVICE_SECRET" \
   -d "grant_type=client_credentials" \
   -d "scope=openid create:document read:document update:document delete:document" | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
 

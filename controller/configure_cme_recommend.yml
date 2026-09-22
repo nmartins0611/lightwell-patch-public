@@ -1,0 +1,74 @@
+---
+# Create the CME Recommend Controls job template on AAP.
+# Keeps the Controller project on neuromancer-aws (does not switch to main).
+#
+# ansible-playbook controller/configure_cme_recommend.yml --ask-vault-pass
+
+- name: "Controller CaC — CME Recommend Controls"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  vars_files:
+    - ../vars/vault.yml
+  vars:
+    controller_host: "{{ vault_controller_host }}"
+    controller_oauthtoken: "{{ vault_controller_token }}"
+    controller_validate_certs: false
+    demo_org: "Default"
+    demo_project: "Lightwell Patch Demo"
+    demo_inventory: "Demo Fleet"
+    demo_scm_branch: "neuromancer-aws"
+
+  tasks:
+    - name: Keep Controller project on neuromancer-aws and sync
+      ansible.controller.project:
+        name: "{{ demo_project }}"
+        organization: "{{ demo_org }}"
+        scm_branch: "{{ demo_scm_branch }}"
+        update_project: true
+        wait: true
+        controller_host: "{{ controller_host }}"
+        controller_oauthtoken: "{{ controller_oauthtoken }}"
+        validate_certs: "{{ controller_validate_certs }}"
+
+    - name: Look up CME Mitigate execution environment
+      ansible.builtin.uri:
+        url: "{{ controller_host | regex_replace('/$', '') }}/api/controller/v2/job_templates/?name=CME%20Mitigate"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ controller_oauthtoken }}"
+          Accept: "application/json"
+        status_code:
+          - 200
+        validate_certs: "{{ controller_validate_certs }}"
+      register: cme_mitigate_lookup
+
+    - name: Set execution environment from CME Mitigate
+      ansible.builtin.set_fact:
+        cme_recommend_ee: "{{ cme_mitigate_lookup.json.results[0].summary_fields.execution_environment.name | default('') }}"
+      when:
+        - (cme_mitigate_lookup.json.results | default([])) | length > 0
+        - cme_mitigate_lookup.json.results[0].summary_fields.execution_environment is defined
+        - cme_mitigate_lookup.json.results[0].summary_fields.execution_environment.name | default('') | length > 0
+
+    - name: Create JT — CME Recommend Controls
+      ansible.controller.job_template:
+        name: "CME Recommend Controls"
+        description: >-
+          Survey for a CVE number, then print recommended CME
+          compensating controls. Does not apply controls.
+        organization: "{{ demo_org }}"
+        project: "{{ demo_project }}"
+        playbook: "playbooks/cme_recommend.yml"
+        inventory: "{{ demo_inventory }}"
+        credentials:
+          - "CME MCP Server"
+        become_enabled: false
+        ask_variables_on_launch: false
+        survey_enabled: true
+        survey_spec: "{{ lookup('file', playbook_dir + '/surveys/cme_recommend.yml') | from_yaml }}"
+        execution_environment: "{{ cme_recommend_ee | default(omit) }}"
+        controller_host: "{{ controller_host }}"
+        controller_oauthtoken: "{{ controller_oauthtoken }}"
+        validate_certs: "{{ controller_validate_certs }}"

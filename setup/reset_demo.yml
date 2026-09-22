@@ -2,16 +2,17 @@
 # Reset Demo — Return everything to pre-demo state
 #
 # Makes the demo fully repeatable by reverting all changes made
-# during Demos 1-4. Run this between demo sessions.
+# during Demos 1-5. Run this between demo sessions.
 #
 # Usage:
 #   ansible-playbook setup/reset_demo.yml -i inventory/hosts.yml --ask-vault-pass
 #
 # Optional tags to reset only specific demos:
 #   --tags os_package     Reset Demo 1-3 (OS-level CVE)
-#   --tags app_dependency Reset Demo 4 (app dependency)
+#   --tags app_dependency Reset Demo 4 (Python app dependency)
+#   --tags java_app       Reset Demo 5 (Java/Maven app dependency)
 #   --tags reports        Clear reports only
-#   --tags gitea          Reset Gitea repo only
+#   --tags gitea          Reset Gitea repos only
 
 - name: "Reset Demo — OS Package State (Demo 1-3)"
   hosts: targets
@@ -22,12 +23,12 @@
     cve_id: "{{ demo_cve_id }}"
 
   tasks:
-    - name: Downgrade python3-cryptography to vulnerable version
-      ansible.builtin.dnf:
-        name: "python3-cryptography-{{ demo_cve_vulnerable_version }}"
-        state: present
-        allow_downgrade: true
-      failed_when: false
+    - name: Note on kernel reset
+      ansible.builtin.debug:
+        msg: >-
+          Kernel patching cannot be reversed via dnf downgrade.
+          Use AWS AMI snapshot restore to return instances to pre-patch state.
+          This reset only clears CME controls and demo artifacts.
 
     - name: Remove any CME compensating controls
       block:
@@ -81,16 +82,16 @@
         state: directory
         mode: "0750"
 
-    - name: Confirm OS package reset
+    - name: Confirm OS package state
       ansible.builtin.command:
-        cmd: rpm -q python3-cryptography
+        cmd: rpm -q kernel-core
       register: pkg_version
       changed_when: false
       failed_when: false
 
     - name: Display OS reset status
       ansible.builtin.debug:
-        msg: "OS package reset: {{ pkg_version.stdout | default('package not found') }}"
+        msg: "Current kernel: {{ pkg_version.stdout | default('unknown') }} — restore from AMI snapshot for full kernel reset"
 
 - name: "Reset Demo — App Dependency State (Demo 4)"
   hosts: targets
@@ -111,7 +112,7 @@
       ansible.builtin.shell:
         cmd: |
           podman images --format '{{ '{{' }}.Repository{{ '}}' }}:{{ '{{' }}.Tag{{ '}}' }}' | \
-            grep -i "{{ app_name }}\|config-service" | \
+            grep -i "{{ app_name }}\|config-service\|simple-webapp" | \
             xargs -r podman rmi -f
       changed_when: true
       failed_when: false
@@ -149,7 +150,7 @@
       ansible.builtin.shell:
         cmd: |
           podman images --format '{{ '{{' }}.Repository{{ '}}' }}:{{ '{{' }}.Tag{{ '}}' }}' | \
-            grep -i "{{ app_name }}\|config-service" | \
+            grep -i "{{ app_name }}\|config-service\|simple-webapp" | \
             xargs -r podman rmi -f
       changed_when: true
       failed_when: false
@@ -164,7 +165,8 @@
         - /tmp/app-rebuild
         - /tmp/Containerfile.patch-test
         - /tmp/Containerfile.patch-apply
-        - /tmp/config-service-seed
+        - /tmp/simple-webapp-seed
+        - /tmp/simple-webapp-baseline
 
     - name: Clean up image tars
       ansible.builtin.shell:
@@ -286,6 +288,375 @@
       ansible.builtin.debug:
         msg: "Gitea repo reset: PRs closed, fix branches deleted, requirements.txt reverted to pyyaml==6.0.1"
 
+- name: "Reset Demo — Gitea Java Repository (Demo 5)"
+  hosts: builders
+  gather_facts: false
+  tags: [gitea, java_app, all_demos]
+  vars_files:
+    - ../vars/vault.yml
+  vars:
+    gitea_url: "http://localhost:{{ gitea_port | default(3000) }}"
+    gitea_admin_user: "demo-admin"
+    gitea_admin_password: "{{ vault_gitea_admin_password }}"
+    app_name: "{{ demo_java_app_name | default('simple-webapp') }}"
+
+  tasks:
+    - name: Check simple-webapp repo exists
+      ansible.builtin.uri:
+        url: "{{ gitea_url }}/api/v1/repos/{{ gitea_admin_user }}/{{ app_name }}"
+        method: GET
+        user: "{{ gitea_admin_user }}"
+        password: "{{ gitea_admin_password }}"
+        force_basic_auth: true
+        status_code: [200, 404]
+      register: java_repo
+
+    - name: Close any open Java app PRs
+      when: java_repo.status == 200
+      block:
+        - name: List open pull requests
+          ansible.builtin.uri:
+            url: "{{ gitea_url }}/api/v1/repos/{{ gitea_admin_user }}/{{ app_name }}/pulls?state=open"
+            method: GET
+            user: "{{ gitea_admin_user }}"
+            password: "{{ gitea_admin_password }}"
+            force_basic_auth: true
+            status_code: [200]
+          register: open_prs
+
+        - name: Close each open PR
+          ansible.builtin.uri:
+            url: "{{ gitea_url }}/api/v1/repos/{{ gitea_admin_user }}/{{ app_name }}/pulls/{{ item.number }}"
+            method: PATCH
+            user: "{{ gitea_admin_user }}"
+            password: "{{ gitea_admin_password }}"
+            force_basic_auth: true
+            body_format: json
+            body:
+              state: "closed"
+            status_code: [200]
+          loop: "{{ open_prs.json }}"
+          loop_control:
+            label: "PR #{{ item.number }}"
+          when: open_prs.json | length > 0
+
+    - name: Delete Java security fix branches
+      when: java_repo.status == 200
+      block:
+        - name: List branches
+          ansible.builtin.uri:
+            url: "{{ gitea_url }}/api/v1/repos/{{ gitea_admin_user }}/{{ app_name }}/branches"
+            method: GET
+            user: "{{ gitea_admin_user }}"
+            password: "{{ gitea_admin_password }}"
+            force_basic_auth: true
+            status_code: [200]
+          register: branches
+
+        - name: Delete security/* branches
+          ansible.builtin.uri:
+            url: "{{ gitea_url }}/api/v1/repos/{{ gitea_admin_user }}/{{ app_name }}/branches/{{ item.name }}"
+            method: DELETE
+            user: "{{ gitea_admin_user }}"
+            password: "{{ gitea_admin_password }}"
+            force_basic_auth: true
+            status_code: [204, 404]
+          loop: "{{ branches.json | selectattr('name', 'match', 'security/.*') | list }}"
+          loop_control:
+            label: "{{ item.name }}"
+          when: branches.json | selectattr('name', 'match', 'security/.*') | list | length > 0
+
+    - name: Reset pom.xml to vulnerable gson pin
+      when: java_repo.status == 200
+      block:
+        - name: Read current pom.xml
+          ansible.builtin.uri:
+            url: "{{ gitea_url }}/api/v1/repos/{{ gitea_admin_user }}/{{ app_name }}/contents/pom.xml"
+            method: GET
+            user: "{{ gitea_admin_user }}"
+            password: "{{ gitea_admin_password }}"
+            force_basic_auth: true
+            status_code: [200]
+          register: pom_file
+
+        - name: Revert gson.version to 2.8.9
+          ansible.builtin.uri:
+            url: "{{ gitea_url }}/api/v1/repos/{{ gitea_admin_user }}/{{ app_name }}/contents/pom.xml"
+            method: PUT
+            user: "{{ gitea_admin_user }}"
+            password: "{{ gitea_admin_password }}"
+            force_basic_auth: true
+            body_format: json
+            body:
+              message: "reset: revert gson.version to 2.8.9 (vulnerable) for demo reset"
+              content: "{{ (pom_file.json.content | b64decode | regex_replace('<gson\\.version>[^<]+</gson\\.version>', '<gson.version>2.8.9</gson.version>')) | b64encode }}"
+              sha: "{{ pom_file.json.sha }}"
+              branch: "main"
+              committer:
+                name: "Demo Reset"
+                email: "demo@example.com"
+            status_code: [200]
+          when: "'<gson.version>2.8.9</gson.version>' not in (pom_file.json.content | b64decode)"
+
+    - name: Display Java Gitea reset status
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'Gitea simple-webapp reset: PRs closed, pom.xml reverted to gson 2.8.9'
+             if java_repo.status == 200
+             else 'simple-webapp repo not present; skip Demo 5 Gitea reset' }}
+
+
+- name: "Reset Demo — Delete all SBOMs from RHTPA"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  tags: [os_package, app_dependency, all_demos]
+  vars_files:
+    - ../vars/vault.yml
+  vars:
+    ansible_become: false
+
+  tasks:
+    - name: Acquire OIDC token from Keycloak
+      ansible.builtin.uri:
+        url: "{{ rhtpa_keycloak_url }}/realms/{{ rhtpa_keycloak_realm }}/protocol/openid-connect/token"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          client_id: "{{ rhtpa_oidc_client_id }}"
+          client_secret: "{{ rhtpa_oidc_client_secret }}"
+          grant_type: "client_credentials"
+          scope: "openid read:document delete:document"
+        status_code: [200]
+        validate_certs: false
+      register: token_response
+
+    - name: List SBOMs in RHTPA
+      ansible.builtin.uri:
+        url: "{{ rhtpa_api_endpoint }}/api/v2/sbom?limit=100"
+        method: GET
+        headers:
+          Accept: "application/json"
+          Authorization: "Bearer {{ token_response.json.access_token }}"
+        status_code: [200]
+        validate_certs: false
+      register: sbom_list
+
+    - name: Delete each SBOM
+      ansible.builtin.uri:
+        url: "{{ rhtpa_api_endpoint }}/api/v2/sbom/{{ item.id }}"
+        method: DELETE
+        headers:
+          Authorization: "Bearer {{ token_response.json.access_token }}"
+        status_code: [200, 204, 404]
+        timeout: 180
+        validate_certs: false
+      loop: "{{ sbom_list.json['items'] | default([]) }}"
+      loop_control:
+        label: "{{ item.name | default(item.id) }}"
+      register: sbom_delete
+      retries: 4
+      delay: 10
+      until: sbom_delete is succeeded
+      when: (sbom_list.json.total | default(0) | int) > 0
+
+    - name: List remaining SBOMs
+      ansible.builtin.uri:
+        url: "{{ rhtpa_api_endpoint }}/api/v2/sbom?limit=100"
+        method: GET
+        headers:
+          Accept: "application/json"
+          Authorization: "Bearer {{ token_response.json.access_token }}"
+        status_code: [200]
+        validate_certs: false
+      register: sbom_remaining
+
+    - name: Delete remaining SBOMs
+      ansible.builtin.uri:
+        url: "{{ rhtpa_api_endpoint }}/api/v2/sbom/{{ item.id }}"
+        method: DELETE
+        headers:
+          Authorization: "Bearer {{ token_response.json.access_token }}"
+        status_code: [200, 204, 404]
+        timeout: 180
+        validate_certs: false
+      loop: "{{ sbom_remaining.json['items'] | default([]) }}"
+      loop_control:
+        label: "{{ item.name | default(item.id) }}"
+      register: sbom_delete_remaining
+      retries: 4
+      delay: 10
+      until: sbom_delete_remaining is succeeded
+      when: (sbom_remaining.json.total | default(0) | int) > 0
+
+    - name: Confirm TPA SBOM catalog is empty
+      ansible.builtin.uri:
+        url: "{{ rhtpa_api_endpoint }}/api/v2/sbom?limit=1"
+        method: GET
+        headers:
+          Accept: "application/json"
+          Authorization: "Bearer {{ token_response.json.access_token }}"
+        status_code: [200]
+        validate_certs: false
+      register: sbom_empty
+
+    - name: Display TPA SBOM reset
+      ansible.builtin.debug:
+        msg: >-
+          Deleted {{ sbom_list.json.total | default(0) }} SBOMs from RHTPA
+          (remaining: {{ sbom_empty.json.total | default(0) }}).
+
+- name: "Reset Demo — Seed baseline app SBOM from Gitea"
+  hosts: builders
+  become: true
+  gather_facts: false
+  tags: [os_package, app_dependency, all_demos]
+  vars:
+    app_name: "{{ demo_app_name | default('config-service') }}"
+    app_sbom_dir: "{{ demo_app_sbom_dir | default('/tmp/sbom-artifacts/app') }}"
+    app_sbom_file: "{{ demo_app_sbom_file | default('/tmp/sbom-artifacts/app/config-service-sbom.json') }}"
+    gitea_url: "http://localhost:{{ gitea_port | default(3000) }}"
+    gitea_owner: "{{ demo_gitea_owner | default('demo-admin') }}"
+    baseline_src: "/tmp/{{ app_name }}-baseline"
+    baseline_image: "localhost/{{ app_name }}:baseline"
+    lightwell_index: "http://lightwell-pypi:8081/simple/"
+
+  tasks:
+    - name: Create app SBOM directory
+      ansible.builtin.file:
+        path: "{{ app_sbom_dir }}"
+        state: directory
+        mode: "0777"
+
+    - name: Clone config-service from Gitea (post-reset pin)
+      ansible.builtin.git:
+        repo: "{{ gitea_url }}/{{ gitea_owner }}/{{ app_name }}.git"
+        dest: "{{ baseline_src }}"
+        version: main
+        force: true
+
+    - name: Record baseline git SHA
+      ansible.builtin.command:
+        cmd: git rev-parse --short HEAD
+        chdir: "{{ baseline_src }}"
+      register: baseline_sha
+      changed_when: false
+
+    - name: Build baseline image from Gitea main
+      ansible.builtin.command:
+        cmd: >-
+          podman build --network=tcnet
+          -f {{ baseline_src }}/Containerfile
+          --build-arg LIGHTWELL_INDEX={{ lightwell_index }}
+          --build-arg LIGHTWELL_HOST=lightwell-pypi
+          -t {{ baseline_image }}
+          {{ baseline_src }}
+      changed_when: true
+
+    - name: Generate CycloneDX SBOM for the Gitea app
+      ansible.builtin.command:
+        cmd: >-
+          podman run --rm --user 0 --security-opt label=disable
+          -v /run/podman/podman.sock:/var/run/docker.sock
+          -v {{ app_sbom_dir }}:/out:Z
+          docker.io/anchore/syft:latest
+          scan {{ baseline_image }}
+          --source-name {{ app_name }}
+          --source-version {{ baseline_sha.stdout }}
+          -o cyclonedx-json@1.6=/out/{{ app_sbom_file | basename }}
+      changed_when: true
+
+    - name: Require baseline SBOM file
+      ansible.builtin.stat:
+        path: "{{ app_sbom_file }}"
+      register: baseline_sbom
+
+    - name: Fail if baseline SBOM was not written
+      ansible.builtin.assert:
+        that:
+          - baseline_sbom.stat.exists
+          - baseline_sbom.stat.size | int > 0
+        fail_msg: "Syft did not write {{ app_sbom_file }}"
+
+- ansible.builtin.import_playbook: ../playbooks/app_sbom_ingest.yml
+
+- name: "Reset Demo — Seed baseline Java app SBOM from Gitea"
+  hosts: builders
+  become: true
+  gather_facts: false
+  tags: [java_app, all_demos]
+  vars:
+    app_name: "{{ demo_java_app_name | default('simple-webapp') }}"
+    app_sbom_dir: "{{ demo_app_sbom_dir | default('/tmp/sbom-artifacts/app') }}"
+    app_sbom_file: "{{ demo_java_sbom_file | default('/tmp/sbom-artifacts/app/simple-webapp-sbom.json') }}"
+    gitea_url: "http://localhost:{{ gitea_port | default(3000) }}"
+    gitea_owner: "{{ demo_gitea_owner | default('demo-admin') }}"
+    baseline_src: "/tmp/{{ app_name }}-baseline"
+    baseline_image: "localhost/{{ app_name }}:baseline"
+    lightwell_maven: "http://lightwell-maven:8080/"
+
+  tasks:
+    - name: Create app SBOM directory
+      ansible.builtin.file:
+        path: "{{ app_sbom_dir }}"
+        state: directory
+        mode: "0777"
+
+    - name: Clone simple-webapp from Gitea (post-reset pin)
+      ansible.builtin.git:
+        repo: "{{ gitea_url }}/{{ gitea_owner }}/{{ app_name }}.git"
+        dest: "{{ baseline_src }}"
+        version: main
+        force: true
+
+    - name: Record Java baseline git SHA
+      ansible.builtin.command:
+        cmd: git rev-parse --short HEAD
+        chdir: "{{ baseline_src }}"
+      register: java_baseline_sha
+      changed_when: false
+
+    - name: Build Java baseline image from Gitea main
+      ansible.builtin.command:
+        cmd: >-
+          podman build --network=tcnet
+          -f {{ baseline_src }}/Containerfile
+          --build-arg LIGHTWELL_MAVEN={{ lightwell_maven }}
+          -t {{ baseline_image }}
+          {{ baseline_src }}
+      changed_when: true
+
+    - name: Generate CycloneDX SBOM for simple-webapp
+      ansible.builtin.command:
+        cmd: >-
+          podman run --rm --user 0 --security-opt label=disable
+          -v /run/podman/podman.sock:/var/run/docker.sock
+          -v {{ app_sbom_dir }}:/out:Z
+          docker.io/anchore/syft:latest
+          scan {{ baseline_image }}
+          --source-name {{ app_name }}
+          --source-version {{ java_baseline_sha.stdout }}
+          -o cyclonedx-json@1.6=/out/{{ app_sbom_file | basename }}
+      changed_when: true
+
+    - name: Require Java baseline SBOM file
+      ansible.builtin.stat:
+        path: "{{ app_sbom_file }}"
+      register: java_baseline_sbom
+
+    - name: Fail if Java baseline SBOM was not written
+      ansible.builtin.assert:
+        that:
+          - java_baseline_sbom.stat.exists
+          - java_baseline_sbom.stat.size | int > 0
+        fail_msg: "Syft did not write {{ app_sbom_file }}"
+
+- ansible.builtin.import_playbook: ../playbooks/app_sbom_ingest.yml
+  vars:
+    demo_app_name: "{{ demo_java_app_name | default('simple-webapp') }}"
+  tags: [java_app, all_demos]
+
 - name: "Reset Demo — Reports and Artifacts"
   hosts: builders
   become: true
@@ -293,11 +664,19 @@
   tags: [reports, all_demos]
 
   tasks:
-    - name: Clear report files from web server
+    - name: Clear published reports from the web server
       ansible.builtin.shell:
-        cmd: "rm -f {{ report_web_dir }}/*.json"
+        cmd: >-
+          find {{ report_web_dir }} -maxdepth 1
+          \( -name '*.json' -o -name '*.html' \)
+          ! -name index.html -delete
       changed_when: true
       failed_when: false
+
+    - name: Clear Gitea app SBOM on the builder
+      ansible.builtin.file:
+        path: "{{ demo_app_sbom_dir | default('/tmp/sbom-artifacts/app') }}"
+        state: absent
 
     - name: Clear local report directory
       ansible.builtin.file:
@@ -345,14 +724,16 @@
           ╔═══════════════════════════════════════╗
           ║         DEMO RESET COMPLETE           ║
           ╠═══════════════════════════════════════╣
-          ║ OS package: reverted to vulnerable    ║
+          ║ Kernel: restore from AMI snapshot     ║
           ║ CME controls: removed                 ║
           ║ App containers: removed from targets  ║
           ║ Gitea repo: reverted to pyyaml==6.0.1 ║
+          ║ Java repo: reverted to gson 2.8.9     ║
           ║ PRs: closed, fix branches deleted     ║
           ║ Build images: cleaned up              ║
           ║ Reports: cleared                      ║
-          ║ SBOMs: cleared                        ║
+          ║ TPA: wiped, then config-service and   ║
+          ║      simple-webapp baselines seeded   ║
           ╚═══════════════════════════════════════╝
 
           Ready to run demos again.

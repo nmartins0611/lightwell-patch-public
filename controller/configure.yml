@@ -52,6 +52,22 @@
         controller_oauthtoken: "{{ controller_oauthtoken }}"
         validate_certs: "{{ controller_validate_certs }}"
 
+    # --- Notification Template (SOC alerting) ---
+
+    - name: Create notification template — CVE Lifecycle Webhook
+      ansible.controller.notification_template:
+        name: "CVE Lifecycle Notifications"
+        organization: "{{ demo_org }}"
+        notification_type: webhook
+        notification_configuration:
+          url: "{{ notification_webhook_url }}"
+          http_method: POST
+          headers:
+            Content-Type: "application/json"
+        controller_host: "{{ controller_host }}"
+        controller_oauthtoken: "{{ controller_oauthtoken }}"
+        validate_certs: "{{ controller_validate_certs }}"
+
     - name: Create machine credential
       ansible.controller.credential:
         name: "{{ demo_credential }}"
@@ -59,7 +75,7 @@
         credential_type: "Machine"
         inputs:
           username: "{{ vault_ansible_user }}"
-          password: "{{ vault_ssh_password }}"
+          ssh_key_data: "{{ vault_ssh_private_key }}"
           become_method: sudo
         controller_host: "{{ controller_host }}"
         controller_oauthtoken: "{{ controller_oauthtoken }}"
@@ -71,7 +87,7 @@
         organization: "{{ demo_org }}"
         scm_type: git
         scm_url: "{{ demo_scm_url }}"
-        scm_branch: main
+        scm_branch: neuromancer-aws
         scm_update_on_launch: true
         wait: false
         controller_host: "{{ controller_host }}"
@@ -178,15 +194,14 @@
       ansible.controller.job_template:
         name: "CME Recommend Controls"
         description: >-
-          Survey for a CVE number, then report recommended CME
+          Survey for a CVE number, then print recommended CME
           compensating controls. Does not apply controls.
         organization: "{{ demo_org }}"
         project: "{{ demo_project }}"
         playbook: "playbooks/cme_recommend.yml"
         inventory: "{{ demo_inventory }}"
         credentials:
-          - "{{ demo_credential }}"
-          - "VaultCreds"
+          - "CME MCP Server"
         become_enabled: false
         ask_variables_on_launch: false
         survey_enabled: true
@@ -284,6 +299,50 @@
         controller_oauthtoken: "{{ controller_oauthtoken }}"
         validate_certs: "{{ controller_validate_certs }}"
 
+    - name: Create JT — App SBOM Ingest
+      ansible.controller.job_template:
+        name: "App SBOM Ingest"
+        organization: "{{ demo_org }}"
+        project: "{{ demo_project }}"
+        playbook: "playbooks/app_sbom_ingest.yml"
+        inventory: "{{ demo_inventory }}"
+        credentials:
+          - "{{ demo_credential }}"
+          - "Vault"
+        ask_variables_on_launch: false
+        controller_host: "{{ controller_host }}"
+        controller_oauthtoken: "{{ controller_oauthtoken }}"
+        validate_certs: "{{ controller_validate_certs }}"
+
+    - name: Create JT — App Deploy
+      ansible.controller.job_template:
+        name: "App Deploy"
+        organization: "{{ demo_org }}"
+        project: "{{ demo_project }}"
+        playbook: "playbooks/app_deploy.yml"
+        inventory: "{{ demo_inventory }}"
+        credentials:
+          - "{{ demo_credential }}"
+        ask_variables_on_launch: false
+        controller_host: "{{ controller_host }}"
+        controller_oauthtoken: "{{ controller_oauthtoken }}"
+        validate_certs: "{{ controller_validate_certs }}"
+
+    - name: Create JT — App Deploy Report
+      ansible.controller.job_template:
+        name: "App Deploy Report"
+        organization: "{{ demo_org }}"
+        project: "{{ demo_project }}"
+        playbook: "playbooks/app_deploy_report.yml"
+        inventory: "{{ demo_inventory }}"
+        credentials:
+          - "{{ demo_credential }}"
+          - "Vault"
+        ask_variables_on_launch: false
+        controller_host: "{{ controller_host }}"
+        controller_oauthtoken: "{{ controller_oauthtoken }}"
+        validate_certs: "{{ controller_validate_certs }}"
+
     - name: Create JT — Reset Demo
       ansible.controller.job_template:
         name: "Reset"
@@ -306,6 +365,10 @@
         organization: "{{ demo_org }}"
         inventory: "{{ demo_inventory }}"
         ask_variables_on_launch: true
+        notification_templates_success:
+          - "CVE Lifecycle Notifications"
+        notification_templates_error:
+          - "CVE Lifecycle Notifications"
         controller_host: "{{ controller_host }}"
         controller_oauthtoken: "{{ controller_oauthtoken }}"
         validate_certs: "{{ controller_validate_certs }}"
@@ -316,6 +379,10 @@
         organization: "{{ demo_org }}"
         inventory: "{{ demo_inventory }}"
         ask_variables_on_launch: true
+        notification_templates_success:
+          - "CVE Lifecycle Notifications"
+        notification_templates_error:
+          - "CVE Lifecycle Notifications"
         controller_host: "{{ controller_host }}"
         controller_oauthtoken: "{{ controller_oauthtoken }}"
         validate_certs: "{{ controller_validate_certs }}"
@@ -375,13 +442,29 @@
         controller_oauthtoken: "{{ controller_oauthtoken }}"
         validate_certs: "{{ controller_validate_certs }}"
 
-    - name: "Workflow 2 Node: Patch VMs (on success)"
+    - name: "Workflow 2 Node: Approval Gate (on success)"
+      ansible.controller.workflow_job_template_node:
+        workflow_job_template: "Patch Test and Deploy"
+        identifier: "approval"
+        approval_node:
+          name: "Approve Production Patch"
+          description: >-
+            Container test passed. Security team must approve
+            before patching production VMs.
+          timeout: 0
+        success_nodes:
+          - "container_test"
+        controller_host: "{{ controller_host }}"
+        controller_oauthtoken: "{{ controller_oauthtoken }}"
+        validate_certs: "{{ controller_validate_certs }}"
+
+    - name: "Workflow 2 Node: Patch VMs (on approval)"
       ansible.controller.workflow_job_template_node:
         workflow_job_template: "Patch Test and Deploy"
         identifier: "patch"
         unified_job_template: "Patch and Verify"
         success_nodes:
-          - "container_test"
+          - "approval"
         controller_host: "{{ controller_host }}"
         controller_oauthtoken: "{{ controller_oauthtoken }}"
         validate_certs: "{{ controller_validate_certs }}"
@@ -439,13 +522,71 @@
         controller_oauthtoken: "{{ controller_oauthtoken }}"
         validate_certs: "{{ controller_validate_certs }}"
 
+    # --- Workflow: App Ingest and Deploy (after Gitea Actions) ---
+
+    - name: Create Workflow — App Ingest and Deploy
+      ansible.controller.workflow_job_template:
+        name: "App Ingest and Deploy"
+        organization: "{{ demo_org }}"
+        inventory: "{{ demo_inventory }}"
+        ask_variables_on_launch: true
+        controller_host: "{{ controller_host }}"
+        controller_oauthtoken: "{{ controller_oauthtoken }}"
+        validate_certs: "{{ controller_validate_certs }}"
+
+    - name: "Workflow 5 Node: App SBOM Ingest"
+      ansible.controller.workflow_job_template_node:
+        workflow_job_template: "App Ingest and Deploy"
+        identifier: "app_sbom_ingest"
+        unified_job_template: "App SBOM Ingest"
+        success_nodes:
+          - "app_deploy"
+        controller_host: "{{ controller_host }}"
+        controller_oauthtoken: "{{ controller_oauthtoken }}"
+        validate_certs: "{{ controller_validate_certs }}"
+
+    - name: "Workflow 5 Node: App Deploy (on success)"
+      ansible.controller.workflow_job_template_node:
+        workflow_job_template: "App Ingest and Deploy"
+        identifier: "app_deploy"
+        unified_job_template: "App Deploy"
+        success_nodes:
+          - "app_deploy_report"
+        controller_host: "{{ controller_host }}"
+        controller_oauthtoken: "{{ controller_oauthtoken }}"
+        validate_certs: "{{ controller_validate_certs }}"
+
+    - name: "Workflow 5 Node: App Deploy Report (on success)"
+      ansible.controller.workflow_job_template_node:
+        workflow_job_template: "App Ingest and Deploy"
+        identifier: "app_deploy_report"
+        unified_job_template: "App Deploy Report"
+        controller_host: "{{ controller_host }}"
+        controller_oauthtoken: "{{ controller_oauthtoken }}"
+        validate_certs: "{{ controller_validate_certs }}"
+
+    # --- Schedule: Continuous Compliance ---
+
+    - name: Create schedule — Weekly SBOM Baseline Refresh
+      ansible.controller.schedule:
+        name: "Weekly SBOM Baseline Refresh"
+        unified_job_template: "SBOM Scan and Upload"
+        rrule: "DTSTART:20260101T060000Z RRULE:FREQ=WEEKLY;INTERVAL=1;BYDAY=MO"
+        enabled: true
+        controller_host: "{{ controller_host }}"
+        controller_oauthtoken: "{{ controller_oauthtoken }}"
+        validate_certs: "{{ controller_validate_certs }}"
+
     - name: Controller configuration complete
       ansible.builtin.debug:
         msg: |
           Controller configured:
-          - 13 Job Templates (7 original + 4 Demo 4 + Reset + CME Recommend)
-          - 4 Workflow Templates (2 original + 2 Demo 4)
+          - 16 Job Templates (7 original + 7 Demo 4 + Reset + CME Recommend)
+          - 5 Workflow Templates (2 original + 3 Demo 4/5)
           - 1 Custom Credential Type (CME MCP Endpoint)
           - 2 Credentials (Machine + CME MCP)
+          - 1 Notification Template (webhook — SOC alerting)
+          - 1 Approval Node (production patch gate in Workflow 2)
+          - 1 Schedule (weekly SBOM re-scan)
           - 1 Project (SCM-synced)
           - 1 Inventory with SCM source

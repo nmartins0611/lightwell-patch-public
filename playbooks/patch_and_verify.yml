@@ -13,7 +13,9 @@
   gather_facts: true
   vars_files:
     - ../vars/vault.yml
-  serial: "{{ patch_serial | default('100%') }}"
+  serial:
+    - 1
+    - "100%"
   vars:
     cve_id: "{{ demo_cve_id }}"
     advisory_id: "{{ demo_advisory_id }}"
@@ -29,7 +31,7 @@
 
     - name: Record pre-patch package state
       ansible.builtin.command:
-        cmd: "rpm -q python3-cryptography"
+        cmd: "rpm -q kernel-core"
       register: pre_patch_version
       changed_when: false
       failed_when: false
@@ -41,7 +43,7 @@
   tasks:
     - name: Apply patch using advisory-based minimal update
       ansible.builtin.dnf:
-        name: "python3-cryptography"
+        name: "kernel"
         state: latest
         update_only: true
         security: true
@@ -49,7 +51,7 @@
 
     - name: Record post-patch package state
       ansible.builtin.command:
-        cmd: "rpm -q python3-cryptography"
+        cmd: "rpm -q kernel-core"
       register: post_patch_version
       changed_when: false
 
@@ -69,15 +71,15 @@
 
     - name: Verify CVE is resolved via package version
       ansible.builtin.command:
-        cmd: "rpm -q python3-cryptography"
+        cmd: "rpm -q kernel-core"
       register: verify_version
       changed_when: false
 
     - name: Run post-patch SBOM scan (refresh for RHTPA)
       ansible.builtin.command:
         cmd: >-
-          syft scan dir:/usr/lib64/python3.9
-          --source-name {{ ansible_host }}
+          syft scan dir:/
+          --source-name {{ inventory_hostname }}
           --output cyclonedx-json={{ sbom_output_dir }}/{{ inventory_hostname }}-sbom-postpatch.json
       changed_when: true
 

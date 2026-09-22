@@ -1,0 +1,21 @@
+FROM registry.access.redhat.com/ubi10/openjdk-21 AS build
+
+ARG LIGHTWELL_MAVEN=http://lightwell-maven:8080/
+ENV LIGHTWELL_MAVEN=${LIGHTWELL_MAVEN}
+
+USER 0
+WORKDIR /build
+
+COPY pom.xml settings.xml ./
+COPY src/ src/
+
+RUN sed -i "s|LIGHTWELL_MAVEN_URL|${LIGHTWELL_MAVEN}|g" settings.xml \
+ && mvn package -s settings.xml -DskipTests
+
+FROM registry.access.redhat.com/ubi10/openjdk-21-runtime
+
+COPY --from=build /build/target/*-runner.jar /deployments/app.jar
+
+EXPOSE 8080
+
+ENTRYPOINT ["java", "-jar", "/deployments/app.jar"]

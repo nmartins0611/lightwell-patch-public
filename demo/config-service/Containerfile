@@ -1,11 +1,18 @@
 FROM registry.access.redhat.com/ubi9/python-311:latest
 
+ARG LIGHTWELL_INDEX=http://lightwell-pypi:8081/simple/
+ARG LIGHTWELL_HOST=lightwell-pypi
+ENV LIGHTWELL_INDEX=${LIGHTWELL_INDEX}
+
 LABEL com.redhat.component="config-service"
 LABEL description="Demo application for Lightwell patch lifecycle"
 
 WORKDIR /opt/app-root/src
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir \
+      --extra-index-url ${LIGHTWELL_INDEX} \
+      --trusted-host ${LIGHTWELL_HOST} \
+      -r requirements.txt
 
 COPY app.py .
 

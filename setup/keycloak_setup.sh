@@ -1,10 +1,9 @@
 #!/bin/bash
 set -euo pipefail
 
-KC_URL="http://localhost:8180"
-KC_ADMIN_USER="${KC_ADMIN_USER:?Set KC_ADMIN_USER}"
+KC_URL="${KC_URL:-http://localhost:8180}"
 KC_ADMIN_PASSWORD="${KC_ADMIN_PASSWORD:?Set KC_ADMIN_PASSWORD}"
-OIDC_CLIENT_SECRET="${OIDC_CLIENT_SECRET:?Set OIDC_CLIENT_SECRET}"
+KC_SERVICE_SECRET="${KC_SERVICE_SECRET:?Set KC_SERVICE_SECRET}"
 KC_DEMO_USER_PASSWORD="${KC_DEMO_USER_PASSWORD:?Set KC_DEMO_USER_PASSWORD}"
 
 echo "Waiting for Keycloak to be ready..."
@@ -23,8 +22,8 @@ done
 echo "Getting admin token..."
 TOKEN=$(curl -sf -X POST "$KC_URL/realms/master/protocol/openid-connect/token" \
   -d "client_id=admin-cli" \
-  -d "username=${KC_ADMIN_USER}" \
-  -d "password=${KC_ADMIN_PASSWORD}" \
+  -d "username=admin" \
+  -d "password=$KC_ADMIN_PASSWORD" \
   -d "grant_type=password" | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
 
 if [ -z "$TOKEN" ]; then
@@ -33,11 +32,20 @@ if [ -z "$TOKEN" ]; then
 fi
 echo "Token acquired (length: ${#TOKEN})"
 
+echo "Allow HTTP on master realm (no TLS in this demo)..."
+MASTER=$(curl -sf -H "Authorization: Bearer $TOKEN" "$KC_URL/admin/realms/master")
+echo "$MASTER" | python3 -c "import sys,json; d=json.load(sys.stdin); d['sslRequired']='none'; json.dump(d, sys.stdout)" > /tmp/kc-master.json
+curl -sf -X PUT "$KC_URL/admin/realms/master" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  --data-binary @/tmp/kc-master.json -o /dev/null
+echo " - master sslRequired=none"
+
 echo "Creating trustification realm..."
 HTTP=$(curl -sf -o /dev/null -w "%{http_code}" -X POST "$KC_URL/admin/realms" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"realm": "trustification", "enabled": true}')
+  -d '{"realm": "trustification", "enabled": true, "sslRequired": "none"}')
 if [ "$HTTP" = "201" ] || [ "$HTTP" = "409" ]; then
   echo " - realm ok (HTTP $HTTP)"
 else
@@ -45,50 +53,44 @@ else
   exit 1
 fi
 
-FRONTEND_JSON=$(python3 -c 'import json; print(json.dumps({
-  "clientId": "frontend",
-  "publicClient": True,
-  "directAccessGrantsEnabled": True,
-  "redirectUris": ["http://localhost:*", "http://127.0.0.1:*"],
-  "webOrigins": ["http://localhost:*", "http://127.0.0.1:*"],
-  "enabled": True
-}))')
-
 echo "Creating frontend client (public)..."
 HTTP=$(curl -sf -o /dev/null -w "%{http_code}" -X POST "$KC_URL/admin/realms/trustification/clients" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d "$FRONTEND_JSON")
+  -d '{
+    "clientId": "frontend",
+    "publicClient": true,
+    "directAccessGrantsEnabled": true,
+    "redirectUris": ["*"],
+    "webOrigins": ["*"],
+    "enabled": true
+  }')
 echo " - frontend client (HTTP $HTTP)"
-
-WALKER_JSON=$(python3 -c 'import json, os; print(json.dumps({
-  "clientId": "walker",
-  "publicClient": False,
-  "directAccessGrantsEnabled": True,
-  "serviceAccountsEnabled": True,
-  "secret": os.environ["OIDC_CLIENT_SECRET"],
-  "redirectUris": ["http://localhost:*", "http://127.0.0.1:*"],
-  "enabled": True
-}))')
 
 echo "Creating walker client (confidential, service account)..."
 HTTP=$(curl -sf -o /dev/null -w "%{http_code}" -X POST "$KC_URL/admin/realms/trustification/clients" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d "$WALKER_JSON")
+  -d '{
+    "clientId": "walker",
+    "publicClient": false,
+    "directAccessGrantsEnabled": true,
+    "serviceAccountsEnabled": true,
+    "secret": "'"$KC_SERVICE_SECRET"'",
+    "redirectUris": ["*"],
+    "enabled": true
+  }')
 echo " - walker client (HTTP $HTTP)"
-
-USER_JSON=$(python3 -c 'import json, os; print(json.dumps({
-  "username": "demo-user",
-  "enabled": True,
-  "credentials": [{"type": "password", "value": os.environ["KC_DEMO_USER_PASSWORD"], "temporary": False}]
-}))')
 
 echo "Creating testing user..."
 HTTP=$(curl -sf -o /dev/null -w "%{http_code}" -X POST "$KC_URL/admin/realms/trustification/users" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d "$USER_JSON")
+  -d '{
+    "username": "demo-user",
+    "enabled": true,
+    "credentials": [{"type": "password", "value": "'"$KC_DEMO_USER_PASSWORD"'", "temporary": false}]
+  }')
 echo " - demo user (HTTP $HTTP)"
 
 echo "KEYCLOAK_SETUP_COMPLETE"

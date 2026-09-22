@@ -80,7 +80,6 @@
           containers.podman.podman_image:
             name: "{{ image_registry }}:{{ image_tag }}"
             path: "/tmp/app-container-rebuild/{{ app_name }}"
-            file: Containerfile
             force: true
           register: build_result
 
@@ -129,6 +128,32 @@
               {{ image_registry }}:{{ image_tag }}
           changed_when: true
 
+        - name: Run rebuilt app on builder for the demo health page
+          ansible.builtin.command:
+            argv:
+              - podman
+              - run
+              - -d
+              - --replace
+              - --name
+              - "{{ app_name }}"
+              - --restart
+              - always
+              - -p
+              - "127.0.0.1:{{ demo_app_port }}:8080"
+              - -e
+              - "CVE_FIX_APPLIED={{ cve_id }}"
+              - -e
+              - "LIGHTWELL_FIX={{ affected_library }}=={{ fixed_version }}"
+              - "{{ image_registry }}:{{ image_tag }}"
+          changed_when: true
+
+        - name: Wait for builder app port
+          ansible.builtin.wait_for:
+            host: 127.0.0.1
+            port: "{{ demo_app_port }}"
+            timeout: 30
+
         - name: Display build summary
           ansible.builtin.debug:
             msg: |
@@ -136,6 +161,7 @@
               Image: {{ image_registry }}:{{ image_tag }}
               CVE scan: CLEAN
               Saved: /tmp/{{ app_name }}-{{ image_tag }}.tar
+              Health page: http://builder.example.com:8080/app/
               ================================
 
 - name: "App Container Rebuild — Rolling Update on Targets"

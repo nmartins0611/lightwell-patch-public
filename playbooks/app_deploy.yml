@@ -1,0 +1,192 @@
+---
+# Demo 4/5: Deploy the Gitea-built image to the fleet
+#
+# Gitea Actions already built localhost/<app>:gitea on the builder.
+# This playbook does not rebuild. It exports that image and rolls it
+# onto the targets with a health check.
+#
+# The image tar is published from the builder HTTP server and pulled
+# by each target. Do not fetch it through the Controller EE — a 1GB
+# image tar is killed there (rc 137).
+#
+# Triggered by: EDA (app_sbom_ready) after App SBOM Ingest succeeds.
+
+- name: "App Deploy — Export Gitea image"
+  hosts: builders
+  become: true
+  gather_facts: false
+  vars:
+    image_tar: "/tmp/{{ demo_app_name }}-gitea.tar"
+    published_tar: "{{ report_web_dir }}/{{ demo_app_name }}-gitea.tar"
+
+  tasks:
+    - name: Require app name
+      ansible.builtin.assert:
+        that:
+          - demo_app_name is defined
+          - (demo_app_name | length) > 0
+        fail_msg: >-
+          demo_app_name must be set (inventory extra vars or the
+          app_sbom_ready event).
+
+    - name: Use image from the event
+      ansible.builtin.set_fact:
+        deploy_image: "{{ app_image }}"
+      when:
+        - app_image is defined
+        - (app_image | length) > 0
+
+    - name: Use Gitea image tag
+      ansible.builtin.set_fact:
+        deploy_image: "localhost/{{ demo_app_name }}:gitea"
+      when: deploy_image is not defined
+
+    - name: Remove previous image tar
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ image_tar }}"
+        - "{{ published_tar }}"
+
+    - name: Export Gitea-built image
+      ansible.builtin.command:
+        argv:
+          - podman
+          - save
+          - -o
+          - "{{ image_tar }}"
+          - "{{ deploy_image }}"
+      changed_when: true
+
+    - name: Publish image tar on the builder HTTP server
+      ansible.builtin.command:
+        argv:
+          - mv
+          - "{{ image_tar }}"
+          - "{{ published_tar }}"
+      changed_when: true
+
+    - name: Restore HTTP SELinux type on the image tar
+      ansible.builtin.file:
+        path: "{{ published_tar }}"
+        mode: "0644"
+        setype: httpd_sys_content_t
+
+- name: "App Deploy — Rolling update on targets"
+  hosts: targets
+  become: true
+  gather_facts: false
+  serial: 1
+  vars:
+    app_name: "{{ demo_app_name }}"
+    image_tar: "/tmp/{{ demo_app_name }}-gitea.tar"
+    image_url: "http://{{ hostvars['node2']['ansible_host'] }}:8080/{{ demo_app_name }}-gitea.tar"
+
+  tasks:
+    - name: Use image from the event
+      ansible.builtin.set_fact:
+        deploy_image: "{{ app_image }}"
+      when:
+        - app_image is defined
+        - (app_image | length) > 0
+
+    - name: Use Gitea image tag
+      ansible.builtin.set_fact:
+        deploy_image: "localhost/{{ demo_app_name }}:gitea"
+      when: deploy_image is not defined
+
+    - name: Use Python app listen port
+      ansible.builtin.set_fact:
+        listen_port: "{{ demo_app_port }}"
+      when: demo_app_name == "config-service"
+
+    - name: Use Java app listen port
+      ansible.builtin.set_fact:
+        listen_port: "{{ demo_java_port }}"
+      when: demo_app_name == "simple-webapp"
+
+    - name: Require a known demo app
+      ansible.builtin.assert:
+        that:
+          - listen_port is defined
+          - deploy_image is defined
+        fail_msg: >-
+          Missing listen_port or deploy_image for '{{ demo_app_name }}'.
+
+    - name: Pull image tar from the builder
+      ansible.builtin.get_url:
+        url: "{{ image_url }}"
+        dest: "{{ image_tar }}"
+        mode: "0644"
+        timeout: 600
+
+    - name: Load image on target
+      ansible.builtin.command:
+        argv:
+          - podman
+          - load
+          - -i
+          - "{{ image_tar }}"
+      changed_when: true
+
+    - name: Stop current container
+      containers.podman.podman_container:
+        name: "{{ app_name }}"
+        state: stopped
+      failed_when: false
+
+    - name: Deploy Gitea-built container
+      containers.podman.podman_container:
+        name: "{{ app_name }}"
+        image: "{{ deploy_image }}"
+        state: started
+        restart_policy: always
+        ports:
+          - "{{ listen_port }}:8080"
+      register: deploy_result
+
+    - name: Wait for startup
+      ansible.builtin.wait_for:
+        port: "{{ listen_port | int }}"
+        timeout: 60
+
+    - name: Post-deploy health check
+      ansible.builtin.uri:
+        url: "http://localhost:{{ listen_port }}/health"
+        method: GET
+        status_code:
+          - 200
+      register: post_health
+      retries: 5
+      delay: 5
+
+    - name: Remove image tar from target
+      ansible.builtin.file:
+        path: "{{ image_tar }}"
+        state: absent
+
+    - name: Display rolling update summary
+      ansible.builtin.debug:
+        msg: |
+          === APP DEPLOY ===
+          Host: {{ inventory_hostname }}
+          App: {{ app_name }}
+          Image: {{ deploy_image }}
+          Port: {{ listen_port }}
+          Healthy: {{ post_health.status == 200 }}
+          FLOW: Gitea Actions built the image. AAP rolled it out.
+          ==================
+
+- name: "App Deploy — Remove published image tar"
+  hosts: builders
+  become: true
+  gather_facts: false
+  vars:
+    published_tar: "{{ report_web_dir }}/{{ demo_app_name }}-gitea.tar"
+
+  tasks:
+    - name: Remove published image tar from the builder
+      ansible.builtin.file:
+        path: "{{ published_tar }}"
+        state: absent

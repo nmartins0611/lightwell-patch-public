@@ -1,0 +1,134 @@
+---
+# Setup: Snapshot Demo Instances (AWS AMI)
+#
+# Creates AMI snapshots of all demo instances for demo reset.
+# Run BEFORE the demo to capture the pre-patch baseline state.
+#
+# Prerequisites:
+#   - AWS CLI configured (or IAM role on the machine running this)
+#   - amazon.aws collection installed in the EE
+#
+# Usage:
+#   ansible-playbook setup/snapshot_instances.yml -e snapshot_name=pre-demo-baseline
+#
+# To restore, terminate the instances and relaunch from the AMIs,
+# or use the companion playbook: setup/restore_snapshot.yml
+
+- name: "Snapshot — Create AMI Backups of Demo Instances"
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  vars:
+    aws_region: "{{ lookup('env', 'AWS_REGION') | default('eu-west-2', true) }}"
+    snapshot_name: "demo-{{ ansible_date_time.date }}"
+    instance_ips:
+      - name: "aap-example"
+        ip: "CHANGE_ME"
+      - name: "node1-example"
+        ip: "CHANGE_ME"
+      - name: "builder-example"
+        ip: "CHANGE_ME"
+      - name: "node3-example"
+        ip: "CHANGE_ME"
+      - name: "node4-example"
+        ip: "CHANGE_ME"
+    wait_for_ami: true
+
+  tasks:
+    - name: Initialize instances list
+      ansible.builtin.set_fact:
+        instances: []
+
+    - name: Look up EC2 instance IDs by private IP
+      amazon.aws.ec2_instance_info:
+        region: "{{ aws_region }}"
+        filters:
+          private-ip-address: "{{ item.ip }}"
+          instance-state-name: running
+      loop: "{{ instance_ips }}"
+      loop_control:
+        label: "{{ item.name }} ({{ item.ip }})"
+      register: instance_lookups
+
+    - name: Build instance map
+      ansible.builtin.set_fact:
+        instances: >-
+          {{
+            instances + [{
+              'name': item.item.name,
+              'ip': item.item.ip,
+              'instance_id': item.instances[0].instance_id
+            }]
+          }}
+      loop: "{{ instance_lookups.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+      when: item.instances | length > 0
+
+    - name: Fail if no instances found
+      ansible.builtin.fail:
+        msg: |
+          No EC2 instances found. Verify:
+            1. AWS credentials are configured (env vars or IAM role)
+            2. Region is correct (current: {{ aws_region }})
+            3. Private IPs match running instances
+          Lookup results: {{ instance_lookups.results | map(attribute='instances') | map('length') | list }}
+      when: instances | length == 0
+
+    - name: Display instances to snapshot
+      ansible.builtin.debug:
+        msg: "{{ instances | map(attribute='name') | list }} ({{ instances | length }} instances)"
+
+    - name: Create AMI snapshot for each instance
+      amazon.aws.ec2_ami:
+        region: "{{ aws_region }}"
+        instance_id: "{{ item.instance_id }}"
+        name: "{{ snapshot_name }}-{{ item.name }}"
+        description: "Demo baseline snapshot for {{ item.name }} ({{ item.ip }})"
+        wait: "{{ wait_for_ami }}"
+        tags:
+          Name: "{{ snapshot_name }}-{{ item.name }}"
+          Environment: "demo"
+          Purpose: "demo-reset-baseline"
+          SourceInstance: "{{ item.instance_id }}"
+          CreatedBy: "ansible-snapshot-playbook"
+      loop: "{{ instances }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: ami_results
+
+    - name: Build snapshot report
+      ansible.builtin.set_fact:
+        snapshot_report: >-
+          {{
+            snapshot_report | default([]) + [{
+              'name': item.item.name,
+              'instance_id': item.item.instance_id,
+              'ami_id': item.image_id,
+              'ami_name': snapshot_name ~ '-' ~ item.item.name
+            }]
+          }}
+      loop: "{{ ami_results.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+
+    - name: Display snapshot summary
+      ansible.builtin.debug:
+        msg: |
+          ╔═══════════════════════════════════════════════════╗
+          ║         AMI SNAPSHOTS CREATED                     ║
+          ╠═══════════════════════════════════════════════════╣
+          {% for s in snapshot_report %}
+          ║ {{ '%-20s' | format(s.name) }} {{ s.ami_id }}      ║
+          {% endfor %}
+          ╚═══════════════════════════════════════════════════╝
+
+          To restore: terminate instances and relaunch from these AMIs,
+          or run: ansible-playbook setup/restore_snapshot.yml \
+                    -e snapshot_name={{ snapshot_name }}
+
+    - name: Save snapshot manifest to file
+      ansible.builtin.copy:
+        content: "{{ snapshot_report | to_nice_json }}"
+        dest: "{{ playbook_dir }}/../.snapshot-manifest.json"
+        mode: "0644"

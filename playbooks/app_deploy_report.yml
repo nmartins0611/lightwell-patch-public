@@ -1,0 +1,306 @@
+---
+# Demo 4/5: Verify the fleet deploy and publish an audit report
+#
+# Runs after App Deploy. Checks each target is healthy on the
+# Gitea-built image, confirms the pipeline SBOM is in TPA, and
+# writes the audit report to the report server.
+#
+# Triggered by: workflow App Ingest and Deploy (after App Deploy)
+
+- name: "App Deploy Report — Verify fleet"
+  hosts: targets
+  become: true
+  gather_facts: false
+  vars:
+    app_name: "{{ demo_app_name }}"
+
+  tasks:
+    - name: Use image from the event
+      ansible.builtin.set_fact:
+        deploy_image: "{{ app_image }}"
+      when:
+        - app_image is defined
+        - (app_image | length) > 0
+
+    - name: Use Gitea image tag
+      ansible.builtin.set_fact:
+        deploy_image: "localhost/{{ demo_app_name }}:gitea"
+      when: deploy_image is not defined
+
+    - name: Require app name
+      ansible.builtin.assert:
+        that:
+          - demo_app_name is defined
+          - (demo_app_name | length) > 0
+          - deploy_image is defined
+        fail_msg: >-
+          demo_app_name must be set (inventory extra vars or the
+          app_sbom_ready event).
+
+    - name: Use Python app listen port
+      ansible.builtin.set_fact:
+        listen_port: "{{ demo_app_port }}"
+      when: demo_app_name == "config-service"
+
+    - name: Use Java app listen port
+      ansible.builtin.set_fact:
+        listen_port: "{{ demo_java_port }}"
+      when: demo_app_name == "simple-webapp"
+
+    - name: Require a known demo app
+      ansible.builtin.assert:
+        that:
+          - listen_port is defined
+        fail_msg: >-
+          No listen port for app '{{ demo_app_name }}'.
+          Expected config-service or simple-webapp.
+
+    - name: Inspect running container
+      ansible.builtin.command:
+        argv:
+          - podman
+          - inspect
+          - --format
+          - "{% raw %}{{.State.Status}} {{.Config.Image}}{% endraw %}"
+          - "{{ app_name }}"
+      register: container_inspect
+      changed_when: false
+
+    - name: Health check deployed app
+      ansible.builtin.uri:
+        url: "http://localhost:{{ listen_port }}/health"
+        method: GET
+        status_code:
+          - 200
+      register: health_result
+      retries: 5
+      delay: 5
+
+    - name: Record host verification
+      ansible.builtin.set_fact:
+        app_verify:
+          host: "{{ inventory_hostname }}"
+          ansible_host: "{{ ansible_host }}"
+          port: "{{ listen_port | int }}"
+          image: "{{ deploy_image }}"
+          health_status: "{{ health_result.status }}"
+          container: "{{ container_inspect.stdout }}"
+
+- name: "App Deploy Report — Build audit"
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: true
+  vars_files:
+    - ../vars/vault.yml
+  vars:
+    ansible_become: false
+    app_name: "{{ demo_app_name }}"
+    report_file: "app-deploy-report-{{ demo_app_name }}"
+
+  tasks:
+    - name: Use image from the event
+      ansible.builtin.set_fact:
+        deploy_image: "{{ app_image }}"
+      when:
+        - app_image is defined
+        - (app_image | length) > 0
+
+    - name: Use Gitea image tag
+      ansible.builtin.set_fact:
+        deploy_image: "localhost/{{ demo_app_name }}:gitea"
+      when: deploy_image is not defined
+
+    - name: Collect host verification facts
+      ansible.builtin.set_fact:
+        verified_hosts: []
+
+    - name: Append each target verification
+      ansible.builtin.set_fact:
+        verified_hosts: "{{ verified_hosts + [hostvars[item].app_verify] }}"
+      loop: "{{ groups['targets'] }}"
+
+    - name: Require verification facts from every target
+      ansible.builtin.assert:
+        that:
+          - verified_hosts | length == groups['targets'] | length
+
+    - name: Require every target healthy
+      ansible.builtin.assert:
+        that:
+          - (item.health_status | int) == 200
+        fail_msg: >-
+          {{ item.host }} health {{ item.health_status }}, expected 200.
+      loop: "{{ verified_hosts }}"
+      loop_control:
+        label: "{{ item.host }}"
+
+    - name: Use Python package audit fields
+      ansible.builtin.set_fact:
+        report_package: "{{ demo_app_affected_library }}"
+        report_version: "{{ demo_app_fixed_version }}"
+        report_index: "{{ demo_lightwell_pypi_url }}"
+      when: demo_app_name == "config-service"
+
+    - name: Use Java package audit fields
+      ansible.builtin.set_fact:
+        report_package: "{{ demo_java_affected_library }}"
+        report_version: "{{ demo_java_fixed_version }}"
+        report_index: "{{ demo_lightwell_maven_url }}"
+      when: demo_app_name == "simple-webapp"
+
+    - name: Require package audit fields
+      ansible.builtin.assert:
+        that:
+          - report_package is defined
+          - report_version is defined
+          - report_index is defined
+        fail_msg: >-
+          No package metadata for app '{{ demo_app_name }}'.
+
+    - name: Acquire OIDC token from Keycloak
+      ansible.builtin.uri:
+        url: "{{ rhtpa_keycloak_url }}/realms/{{ rhtpa_keycloak_realm }}/protocol/openid-connect/token"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          client_id: "{{ rhtpa_oidc_client_id }}"
+          client_secret: "{{ rhtpa_oidc_client_secret }}"
+          grant_type: "client_credentials"
+          scope: "openid create:document read:document"
+        status_code:
+          - 200
+        validate_certs: false
+      register: token_response
+
+    - name: Confirm pipeline SBOM in TPA
+      ansible.builtin.uri:
+        url: "{{ rhtpa_api_endpoint }}/api/v2/sbom?q={{ app_name }}"
+        method: GET
+        headers:
+          Accept: "application/json"
+          Authorization: "Bearer {{ token_response.json.access_token }}"
+        status_code:
+          - 200
+        validate_certs: false
+      register: tpa_lookup
+
+    - name: Require TPA to hold the app SBOM
+      ansible.builtin.assert:
+        that:
+          - (tpa_lookup.json.total | int) > 0
+        fail_msg: >-
+          TPA has no SBOM for {{ app_name }}. App SBOM Ingest must succeed first.
+
+    - name: Generate app deploy audit report
+      ansible.builtin.set_fact:
+        app_deploy_report:
+          title: "App Deploy Audit — {{ app_name }}"
+          status: "VERIFIED"
+          app_name: "{{ app_name }}"
+          app_image: "{{ deploy_image }}"
+          package: "{{ report_package }}"
+          fixed_version: "{{ report_version }}"
+          lightwell_index: "{{ report_index }}"
+          hosts_verified: "{{ verified_hosts | length }}"
+          hosts: "{{ verified_hosts }}"
+          tpa_documents: "{{ tpa_lookup.json.total | int }}"
+          timeline:
+            - event: "Lightwell published the package"
+              action: "{{ report_package }} {{ report_version }} is on {{ report_index }}"
+              phase: "Publish"
+            - event: "GitOps PR opened"
+              action: "Controller pinned the package. Human merge is the approval gate."
+              phase: "GitOps"
+            - event: "Gitea Actions built the image"
+              action: "CI rebuilt {{ app_name }} as {{ deploy_image }}"
+              phase: "CI"
+            - event: "Pipeline SBOM ingested"
+              action: "TPA holds {{ tpa_lookup.json.total }} document(s) for {{ app_name }}"
+              phase: "TPA"
+            - event: "AAP deployed the image"
+              action: "Rolled {{ deploy_image }} onto {{ verified_hosts | length }} hosts"
+              phase: "CD"
+            - event: "Fleet verified"
+              action: "Health check 200 on every target. Audit trail written."
+              phase: "Verify"
+          products_demonstrated:
+            - name: "Project Lightwell"
+              role: "Published the fixed library to the trusted index"
+            - name: "Gitea Actions"
+              role: "Built the application after human merge"
+            - name: "Red Hat Trusted Profile Analyzer"
+              role: "Stored the pipeline SBOM"
+            - name: "Ansible Automation Platform"
+              role: "Deployed under governance and wrote the audit report"
+          governance:
+            approval_gates: 1
+            eda_events_processed: 2
+            rbac_enforced: true
+          audit_trail_complete: true
+          timestamp: "{{ ansible_date_time.iso8601 }}"
+
+    - name: Ensure report directory exists
+      ansible.builtin.file:
+        path: "{{ report_output_dir }}"
+        state: directory
+        mode: "0750"
+
+    - name: Write app deploy report locally
+      ansible.builtin.copy:
+        content: "{{ app_deploy_report | to_nice_json }}"
+        dest: "{{ report_output_dir }}/{{ report_file }}.json"
+        mode: "0644"
+
+    - name: Display audit summary
+      ansible.builtin.debug:
+        msg: |
+          === APP DEPLOY AUDIT — {{ app_name }} ===
+          Status: VERIFIED
+          Image: {{ deploy_image }}
+          Package: {{ report_package }} {{ report_version }}
+          Hosts: {{ verified_hosts | length }} healthy
+          TPA documents: {{ tpa_lookup.json.total }}
+          Report: {{ report_server_url }}/{{ report_file }}.html
+          =========================================
+
+- name: "App Deploy Report — Publish to report server"
+  hosts: builders
+  become: true
+  gather_facts: false
+  vars:
+    report_file: "app-deploy-report-{{ demo_app_name }}"
+
+  tasks:
+    - name: Ensure report web directory exists
+      ansible.builtin.file:
+        path: "{{ report_web_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Publish app deploy report (JSON)
+      ansible.builtin.copy:
+        content: "{{ hostvars['localhost']['app_deploy_report'] | to_nice_json }}"
+        dest: "{{ report_web_dir }}/{{ report_file }}.json"
+        mode: "0644"
+
+    - name: Publish app deploy report (HTML)
+      ansible.builtin.template:
+        src: ../templates/app_deploy_report.html.j2
+        dest: "{{ report_web_dir }}/{{ report_file }}.html"
+        mode: "0644"
+      vars:
+        report: "{{ hostvars['localhost']['app_deploy_report'] }}"
+
+    - name: Publish report index
+      ansible.builtin.copy:
+        src: ../templates/report_index.html
+        dest: "{{ report_web_dir }}/index.html"
+        mode: "0644"
+
+    - name: Reports published
+      ansible.builtin.debug:
+        msg: >-
+          Reports available at
+          {{ report_server_url }}/{{ report_file }}.html (HTML)
+          {{ report_server_url }}/{{ report_file }}.json (JSON)

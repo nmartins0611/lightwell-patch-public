@@ -1,13 +1,13 @@
 #!/bin/bash
 set -euo pipefail
 
-KC_URL="http://localhost:8180"
-RHTPA_URL="https://localhost:8443"
-OIDC_CLIENT_SECRET="${OIDC_CLIENT_SECRET:?Set OIDC_CLIENT_SECRET}"
+KC_URL="${KC_URL:-http://localhost:8180}"
+RHTPA_URL="${RHTPA_URL:-https://localhost:8443}"
+KC_SERVICE_SECRET="${KC_SERVICE_SECRET:?Set KC_SERVICE_SECRET}"
 
 TOKEN=$(curl -sf -X POST "$KC_URL/realms/trustification/protocol/openid-connect/token" \
   -d "client_id=walker" \
-  -d "client_secret=${OIDC_CLIENT_SECRET}" \
+  -d "client_secret=$KC_SERVICE_SECRET" \
   -d "grant_type=client_credentials" \
   -d "scope=openid create:document read:document update:document delete:document" \
   | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")

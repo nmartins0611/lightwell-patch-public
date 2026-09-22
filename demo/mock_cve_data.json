@@ -1,46 +1,45 @@
 {
-  "cve_id": "CVE-2026-51234",
-  "description": "Remote code execution vulnerability in python-cryptography due to buffer overflow in X.509 certificate parsing. An attacker can craft a malicious X.509 certificate that, when parsed by an application using python-cryptography, triggers a heap buffer overflow allowing arbitrary code execution.",
-  "affected_package": "python-cryptography",
-  "affected_versions": "< 43.0.1",
-  "fixed_version": "43.0.1-2.el9",
-  "advisory_id": "RHSA-2026:4521",
+  "cve_id": "CVE-2026-31419",
+  "description": "Use-after-free vulnerability in the Linux kernel's bonding driver in bond_xmit_broadcast(). A local attacker with low privileges can exploit a race condition during concurrent slave enslave/release operations, causing the original socket buffer (skb) to be double-freed, leading to a system crash and potential privilege escalation.",
+  "affected_package": "kernel",
+  "affected_versions": "< 6.12.0-211.22.1.el10_2",
+  "fixed_version": "6.12.0-211.22.1.el10_2",
+  "advisory_id": "RHSA-2026:25191",
   "cvss": {
     "version": "3.1",
-    "vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H",
-    "base_score": 10.0,
-    "severity": "Critical"
+    "vector": "CVSS:3.1/AV:L/AC:H/PR:L/UI:N/S:U/C:H/I:H/A:H",
+    "base_score": 7.0,
+    "severity": "Important"
   },
-  "cwe_ids": ["CWE-119", "CWE-787"],
+  "cwe_ids": ["CWE-416"],
   "cwe_descriptions": {
-    "CWE-119": "Improper Restriction of Operations within the Bounds of a Memory Buffer",
-    "CWE-787": "Out-of-bounds Write"
+    "CWE-416": "Use After Free"
   },
-  "attack_vector": "Network",
-  "attack_complexity": "Low",
-  "privileges_required": "None",
+  "attack_vector": "Local",
+  "attack_complexity": "High",
+  "privileges_required": "Low",
   "user_interaction": "None",
-  "scope": "Changed",
+  "scope": "Unchanged",
   "platforms_affected": [
+    "RHEL 10.2 (x86_64)",
+    "RHEL 10.1 (x86_64)",
+    "RHEL 10.0 EUS (x86_64)",
     "RHEL 9 (all architectures)",
-    "RHEL 8 (all architectures)",
-    "Fedora 39+",
-    "CentOS Stream 9"
+    "RHEL 8.8+ (all architectures)"
   ],
-  "cisa_kev": true,
-  "actively_exploited": true,
+  "cisa_kev": false,
+  "actively_exploited": false,
   "lightwell_resolution": {
     "resolved": true,
-    "resolution_date": "2026-07-30T12:00:00Z",
-    "upstream_commit": "https://github.com/pyca/cryptography/commit/abc123def456",
-    "engineers_involved": 3,
-    "time_to_fix_hours": 18
+    "resolution_date": "2026-06-11T06:00:00Z",
+    "upstream_commit": "https://lore.kernel.org/linux-cve-announce/2026041353-CVE-2026-31419-e176@gregkh/T",
+    "engineers_involved": 2,
+    "time_to_fix_hours": 72
   },
   "timeline": {
-    "discovered": "2026-07-29T22:00:00Z",
-    "disclosed": "2026-07-30T08:00:00Z",
-    "cisa_kev_added": "2026-07-30T09:00:00Z",
-    "lightwell_resolved": "2026-07-30T12:00:00Z",
-    "rhsa_published": "2026-07-30T14:00:00Z"
+    "discovered": "2026-04-13T00:00:00Z",
+    "disclosed": "2026-04-13T00:00:00Z",
+    "lightwell_resolved": "2026-06-11T06:00:00Z",
+    "rhsa_published": "2026-06-11T14:00:00Z"
   }
 }

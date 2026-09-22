@@ -1,0 +1,104 @@
+---
+# Setup: Restore Demo Instances from AMI Snapshots
+#
+# Terminates the current instances and relaunches from the baseline AMIs.
+# This fully resets the environment including kernel version.
+#
+# Prerequisites:
+#   - .snapshot-manifest.json must exist (created by snapshot_instances.yml)
+#   - AWS CLI configured (or IAM role)
+#   - amazon.aws collection installed in the EE
+#
+# Usage:
+#   ansible-playbook setup/restore_snapshot.yml
+#   ansible-playbook setup/restore_snapshot.yml -e snapshot_name=demo-baseline
+
+- name: "Restore — Relaunch Demo Instances from AMI Snapshots"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    aws_region: "{{ lookup('env', 'AWS_REGION') | default('eu-west-2', true) }}"
+    manifest_path: "{{ playbook_dir }}/../.snapshot-manifest.json"
+    instance_type: "t3.medium"
+    key_name: "CHANGE_ME"
+    subnet_ids:
+      aap-example: ""
+      node1-example: ""
+      builder-example: ""
+      node3-example: ""
+      node4-example: ""
+    security_group: ""
+
+  tasks:
+    - name: Load snapshot manifest
+      ansible.builtin.slurp:
+        src: "{{ manifest_path }}"
+      register: manifest_raw
+
+    - name: Parse manifest
+      ansible.builtin.set_fact:
+        snapshots: "{{ manifest_raw.content | b64decode | from_json }}"
+
+    - name: Display restore plan
+      ansible.builtin.debug:
+        msg: |
+          Will restore {{ snapshots | length }} instances:
+          {% for s in snapshots %}
+            - {{ s.name }}: {{ s.ami_id }} (replaces {{ s.instance_id }})
+          {% endfor %}
+
+          WARNING: This will TERMINATE the current instances!
+
+    - name: Terminate current instances
+      amazon.aws.ec2_instance:
+        region: "{{ aws_region }}"
+        instance_ids:
+          - "{{ item.instance_id }}"
+        state: terminated
+        wait: true
+      loop: "{{ snapshots }}"
+      loop_control:
+        label: "{{ item.name }} ({{ item.instance_id }})"
+
+    - name: Wait for termination to complete
+      ansible.builtin.pause:
+        seconds: 30
+        prompt: "Waiting for instances to fully terminate..."
+
+    - name: Launch new instances from AMI snapshots
+      amazon.aws.ec2_instance:
+        region: "{{ aws_region }}"
+        name: "{{ item.name }}"
+        image_id: "{{ item.ami_id }}"
+        instance_type: "{{ instance_type }}"
+        key_name: "{{ key_name }}"
+        security_group: "{{ security_group }}"
+        network:
+          assign_public_ip: true
+        state: running
+        wait: true
+        tags:
+          Name: "{{ item.name }}"
+          Environment: "demo"
+          RestoredFrom: "{{ item.ami_id }}"
+      loop: "{{ snapshots }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: launch_results
+
+    - name: Display new instance details
+      ansible.builtin.debug:
+        msg: |
+          ╔═══════════════════════════════════════════════════╗
+          ║         INSTANCES RESTORED                        ║
+          ╠═══════════════════════════════════════════════════╣
+          {% for r in launch_results.results %}
+          ║ {{ '%-20s' | format(r.item.name) }} {{ r.instances[0].instance_id }} ({{ r.instances[0].private_ip_address }})
+          {% endfor %}
+          ╚═══════════════════════════════════════════════════╝
+
+          NOTE: Private IPs may have changed. Update /etc/hosts on
+          all instances if IPs differ from the original allocation.
+
+          Next: Run setup/prepare_target.yml to verify readiness.

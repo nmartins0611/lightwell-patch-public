@@ -1,5 +1,11 @@
 ---
+- name: "Skip {{ control_id }} — would affect SSH connectivity"
+  ansible.builtin.debug:
+    msg: "Control {{ control_id }} skipped to preserve SSH (sshd/crypto/firewall guard)"
+  when: control_id in (cme_ssh_unsafe_controls | default([]))
+
 - name: "Apply control {{ control_id }}"
+  when: control_id not in (cme_ssh_unsafe_controls | default([]))
   block:
     - name: "Include role {{ control_id }}"
       ansible.builtin.include_role:

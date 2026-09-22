@@ -1,0 +1,81 @@
+name: Build after merge
+
+# Runs when main moves, including after a GitOps PR is merged.
+# Do not run on pull_request: the human merge is the approval gate.
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-image:
+    runs-on: docker
+    defaults:
+      run:
+        shell: sh
+    steps:
+      - name: Checkout
+        run: |
+          apk add --no-cache git
+          git clone --depth 1 --branch "${GITHUB_REF_NAME}" \
+            "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" /tmp/src
+          cp -a /tmp/src/. .
+          rm -rf /tmp/src/.git
+
+      - name: Build image with Lightwell Maven
+        run: |
+          DOCKER_BUILDKIT=0 docker build \
+            -f Containerfile \
+            --build-arg LIGHTWELL_MAVEN=http://builder.example.com:8082/ \
+            -t localhost/simple-webapp:gitea \
+            -t localhost/simple-webapp:latest \
+            .
+
+      - name: Run patched app on host port 8091
+        run: |
+          docker rm -f simple-webapp >/dev/null 2>&1 || true
+          docker run -d \
+            --name simple-webapp \
+            --network tcnet \
+            -p 127.0.0.1:8091:8080 \
+            localhost/simple-webapp:gitea
+          sleep 12
+          docker run --rm --network tcnet docker.io/library/busybox:latest \
+            wget -qO- http://simple-webapp:8080/health
+          echo
+          docker run --rm --network tcnet docker.io/library/busybox:latest \
+            wget -qO- http://simple-webapp:8080/version
+          echo
+
+      - name: Produce app SBOM for TPA ingest
+        run: |
+          docker run --rm --user 0 --security-opt label=disable \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v /tmp/sbom-artifacts/app:/out:Z \
+            docker.io/anchore/syft:latest \
+            scan localhost/simple-webapp:gitea \
+            --source-name simple-webapp \
+            --source-version "${GITHUB_SHA}" \
+            -o cyclonedx-json@1.6=/out/simple-webapp-sbom.json
+          docker run --rm --user 0 --security-opt label=disable \
+            -v /tmp/sbom-artifacts/app:/out:Z \
+            docker.io/library/busybox:latest \
+            ls -l /out/simple-webapp-sbom.json
+
+      - name: Notify AAP to ingest the SBOM
+        env:
+          EDA_SECRET: ${{ secrets.EDA_WEBHOOK_SECRET }}
+          EDA_URL: ${{ vars.EDA_EVENT_STREAM_URL }}
+        run: |
+          if [ -z "${EDA_SECRET}" ] || [ -z "${EDA_URL}" ]; then
+            echo "EDA_WEBHOOK_SECRET or EDA_EVENT_STREAM_URL not set; skip notify"
+            exit 0
+          fi
+          apk add --no-cache openssl curl
+          BODY='{"type":"app_sbom_ready","app_name":"simple-webapp","image":"localhost/simple-webapp:gitea"}'
+          SIG=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "${EDA_SECRET}" | awk '{print $NF}')
+          curl -k -sS -X POST \
+            -H 'Content-Type: application/json' \
+            -H "X-Hub-Signature-256: sha256=${SIG}" \
+            --data-binary "$BODY" \
+            "${EDA_URL}"

@@ -10,9 +10,15 @@
 
 set -euo pipefail
 
-SPLUNK_HOST="${SPLUNK_HOST:?Set SPLUNK_HOST}"
+SPLUNK_HOST="${SPLUNK_HOST:-}"
 SPLUNK_HEC_PORT="${SPLUNK_HEC_PORT:-8088}"
-SPLUNK_HEC_TOKEN="${SPLUNK_HEC_TOKEN:?Set SPLUNK_HEC_TOKEN}"
+SPLUNK_HEC_TOKEN="${SPLUNK_HEC_TOKEN:-}"
+
+if [[ -z "${SPLUNK_HOST}" || -z "${SPLUNK_HEC_TOKEN}" ]]; then
+  echo "ERROR: SPLUNK_HOST and SPLUNK_HEC_TOKEN must both be set."
+  echo "Set SPLUNK_HOST=<host> SPLUNK_HEC_TOKEN=<token> to use."
+  exit 1
+fi
 
 echo "=== Injecting CVE Disclosure into Splunk ==="
 echo "Target: http://${SPLUNK_HOST}:${SPLUNK_HEC_PORT}/services/collector/event"
@@ -27,17 +33,17 @@ RESPONSE=$(curl -sk "http://${SPLUNK_HOST}:${SPLUNK_HEC_PORT}/services/collector
     "source": "threat_intel_feed",
     "event": {
       "event_type": "cve_disclosure",
-      "cve_id": "CVE-2026-51234",
-      "affected_package": "python-cryptography",
-      "affected_version_range": "< 43.0.1",
-      "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H",
-      "cvss_score": 10.0,
-      "cwe_ids": "[\"CWE-119\", \"CWE-787\"]",
-      "description": "Remote code execution vulnerability in python-cryptography due to buffer overflow in X.509 certificate parsing",
-      "source": "CISA KEV / NVD",
+      "cve_id": "CVE-2026-31419",
+      "affected_package": "kernel",
+      "affected_version_range": "< 6.12.0-211.22.1.el10_2",
+      "cvss_vector": "CVSS:3.1/AV:L/AC:H/PR:L/UI:N/S:U/C:H/I:H/A:H",
+      "cvss_score": 7.0,
+      "cwe_ids": "[\"CWE-416\"]",
+      "description": "Use-after-free vulnerability in Linux kernel bonding driver (bond_xmit_broadcast) leads to denial of service via double-free of socket buffer",
+      "source": "Red Hat Security Advisory",
       "fix_available": false,
-      "published_date": "2026-07-30T08:00:00Z",
-      "severity": "critical"
+      "published_date": "2026-06-11T06:00:00Z",
+      "severity": "important"
     }
   }')
 

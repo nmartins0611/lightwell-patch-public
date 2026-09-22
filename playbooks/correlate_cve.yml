@@ -7,6 +7,21 @@
 #
 # Triggered by: EDA workflow (after sbom_scan_upload or from stored SBOMs)
 
+- name: "CVE Correlation — Gather host identity facts"
+  hosts: targets
+  gather_facts: true
+  gather_subset:
+    - "!all"
+    - "!min"
+    - machine
+
+  tasks:
+    - name: Confirm machine_id is available
+      ansible.builtin.assert:
+        that: ansible_machine_id is defined and ansible_machine_id | length > 0
+        fail_msg: "ansible_machine_id not available on {{ inventory_hostname }} — check /etc/machine-id"
+        quiet: true
+
 - name: "CVE Correlation — Query RHTPA and Map to Inventory"
   hosts: localhost
   connection: local
@@ -18,6 +33,12 @@
     affected_package: "{{ demo_cve_package }}"
     cvss_vector: "{{ demo_cvss_vector }}"
     cwe_ids: "{{ demo_cwe_ids }}"
+    vulnerable_package_purl: >-
+      {{ demo_cve_vulnerable_purl | default(
+           'pkg:rpm/redhat/kernel-core@' ~ demo_cve_vulnerable_version
+           ~ '?arch=x86_64&distro=rhel-10.2&upstream=kernel-'
+           ~ demo_cve_vulnerable_version ~ '.src.rpm'
+         ) }}
 
   tasks:
     - name: Acquire OIDC token from Keycloak
@@ -54,7 +75,7 @@
 
     - name: Query RHTPA for SBOMs containing the vulnerable package
       ansible.builtin.uri:
-        url: "{{ rhtpa_api_endpoint }}/api/v2/sbom/by-package?purl=pkg%3Apypi%2Fcryptography%4036.0.1"
+        url: "{{ rhtpa_api_endpoint }}/api/v2/sbom/by-package?{{ {'purl': vulnerable_package_purl} | urlencode }}"
         method: GET
         headers:
           Accept: "application/json"
@@ -65,15 +86,15 @@
 
     - name: Extract SBOM source names from RHTPA results
       ansible.builtin.set_fact:
-        sbom_source_names: "{{ rhtpa_sbom_results.json['items'] | map(attribute='name') | list }}"
+        sbom_source_names: "{{ rhtpa_sbom_results.json['items'] | map(attribute='name') | unique | list }}"
 
-    - name: Build reverse lookup of ansible_host to inventory_hostname
+    - name: Build reverse lookup of machine_id to inventory_hostname
       ansible.builtin.set_fact:
         host_lookup: >-
           {{
             dict(
               groups['targets']
-              | map('extract', hostvars, 'ansible_host')
+              | map('extract', hostvars, 'ansible_machine_id')
               | zip(groups['targets'])
             )
           }}
@@ -82,17 +103,19 @@
       ansible.builtin.set_fact:
         affected_hosts: >-
           {{
-            sbom_source_names
-            | select('in', host_lookup.keys())
-            | map('extract', host_lookup)
-            | list
+            (
+              (sbom_source_names | select('in', host_lookup.keys()) | map('extract', host_lookup) | list)
+              +
+              (sbom_source_names | select('in', groups['targets']) | list)
+            ) | unique
           }}
 
     - name: Display RHTPA correlation results
       ansible.builtin.debug:
         msg: >-
-          RHTPA returned {{ rhtpa_sbom_results.json.total }} SBOMs containing {{ affected_package }}.
-          Mapped to inventory: {{ affected_hosts | join(', ') }}
+          RHTPA returned {{ rhtpa_sbom_results.json.total }} SBOMs containing {{ affected_package }}
+          (names: {{ sbom_source_names | join(', ') }}).
+          Mapped to inventory: {{ affected_hosts | join(', ') or '(none)' }}
 
     - name: Build host detail records for report
       ansible.builtin.set_fact:
@@ -156,6 +179,15 @@
           Recommended action: {{ exposure_report.recommended_action }}
           ===========================
 
+    - name: Publish correlation results for AO routing
+      ansible.builtin.set_stats:
+        data:
+          ao_is_affected: "{{ (affected_hosts | length > 0) | string | lower }}"
+          ao_affected_count: "{{ affected_hosts | length }}"
+          ao_cvss_score: "{{ exposure_report.cvss_base_score | string }}"
+          ao_high_severity: "{{ (exposure_report.cvss_base_score | float >= 7.0) | string | lower }}"
+          ao_fix_available: "{{ exposure_report.fix_available | string | lower }}"
+
     - name: Create dynamic inventory for affected hosts on Controller
       ansible.controller.inventory:
         name: "affected_hosts-{{ cve_id }}"
@@ -189,6 +221,69 @@
         msg: >-
           Created inventory 'affected_hosts-{{ cve_id }}' on Controller
           with {{ affected_hosts | length }} hosts: {{ affected_hosts | join(', ') }}
+
+    - name: Create ServiceNow security incident for CVE
+      servicenow.itsm.incident:
+        state: new
+        caller_id: "{{ snow_caller_id }}"
+        short_description: "{{ cve_id }} — {{ affected_hosts | length }} hosts exposed ({{ affected_package }})"
+        description: |
+          Automated CVE exposure alert from Ansible Automation Platform.
+
+          CVE: {{ cve_id }}
+          CVSS: {{ exposure_report.cvss_base_score }} ({{ cvss_vector }})
+          Affected package: {{ affected_package }}
+          Affected hosts ({{ affected_hosts | length }}):
+          {% for h in affected_hosts %}
+            - {{ h }} ({{ hostvars[h]['ansible_host'] | default(h) }}, {{ hostvars[h]['environment_type'] | default('unknown') }})
+          {% endfor %}
+
+          Advisory: {{ exposure_report.rhtpa_advisory }}
+          Fix available: {{ exposure_report.fix_available }}
+          Recommended action: {{ exposure_report.recommended_action }}
+
+          Correlation source: RHTPA SBOM lookup ({{ rhtpa_sbom_results.json.total }} SBOMs matched)
+          Generated by AAP job {{ tower_job_id | default('N/A') }}
+        impact: high
+        urgency: high
+        assignment_group: "{{ snow_assignment_group }}"
+        instance:
+          host: "{{ snow_instance_host }}"
+          username: "{{ vault_snow_username }}"
+          password: "{{ vault_snow_password }}"
+      register: snow_incident
+      when: snow_enabled | bool
+
+    - name: Store incident number for downstream workflow steps
+      ansible.builtin.set_stats:
+        data:
+          snow_incident_number: "{{ snow_incident.record.number }}"
+          snow_incident_sys_id: "{{ snow_incident.record.sys_id }}"
+      when: snow_enabled | bool and snow_incident is not skipped
+
+    - name: Update CMDB CIs for affected hosts with vulnerability exposure
+      servicenow.itsm.configuration_item:
+        sys_class_name: "{{ snow_cmdb_class }}"
+        name: "{{ hostvars[item]['ansible_host'] | default(item) }}"
+        other:
+          u_active_cve: "{{ cve_id }}"
+          u_cve_cvss_score: "{{ exposure_report.cvss_base_score }}"
+          u_cve_affected_package: "{{ affected_package }}"
+          u_cve_incident: "{{ snow_incident.record.number }}"
+          u_cve_detected_at: "{{ ansible_date_time.iso8601 }}"
+        instance:
+          host: "{{ snow_instance_host }}"
+          username: "{{ vault_snow_username }}"
+          password: "{{ vault_snow_password }}"
+      loop: "{{ affected_hosts }}"
+      when: snow_enabled | bool and snow_incident is not skipped
+
+    - name: Display ServiceNow integration results
+      ansible.builtin.debug:
+        msg: >-
+          ServiceNow incident {{ snow_incident.record.number }} created.
+          {{ affected_hosts | length }} CMDB CIs updated with CVE exposure data.
+      when: snow_enabled | bool and snow_incident is not skipped
 
 - name: "Publish Exposure Report to Report Server"
   hosts: builders
