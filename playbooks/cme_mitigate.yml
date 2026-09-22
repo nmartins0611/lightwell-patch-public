@@ -1,0 +1,197 @@
+---
+# Demo 2, Phase 1: CME Compensating Controls — Mitigate While Waiting for Fix
+#
+# Queries the CME MCP server with the CVE's CVSS vector and CWE IDs to
+# determine which defensive controls are relevant, audits the current
+# posture (PRE), then applies automated remediation through the
+# cme.controls collection roles.
+#
+# Triggered by: EDA workflow (after correlate_cve identifies affected hosts)
+
+###############################################################################
+# PHASE 1: QUERY CME MCP — Which controls mitigate this CVE?
+###############################################################################
+- name: "CME Query — Determine Relevant Controls"
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  vars_files:
+    - ../vars/vault.yml
+  vars:
+    cve_id: "{{ demo_cve_id }}"
+    cvss_vector: "{{ demo_cvss_vector }}"
+    cwe_ids: "{{ demo_cwe_ids }}"
+
+  tasks:
+    - name: Query CME MCP for mitigating controls
+      cme.controls.cme_query:
+        cvss_vector: "{{ cvss_vector }}"
+        cwe_ids: "{{ cwe_ids }}"
+        mcp_endpoint: "{{ cme_mcp_endpoint }}"
+      register: cme_query_result
+
+    - name: Display query results
+      ansible.builtin.debug:
+        msg: >-
+          CME found {{ cme_query_result.cme_ids | length }} controls for {{ cve_id }}
+          ({{ cme_query_result.query_summary.matched_by_vector }} by CVSS vector,
+          {{ cme_query_result.query_summary.matched_by_cwe }} by CWE)
+
+    - name: Build dynamic profile
+      ansible.builtin.set_fact:
+        cme_dynamic_profile:
+          controls: "{{ cme_query_result.cme_ids | map('lower') | map('replace', '-', '_') | list }}"
+        cme_dynamic_cme_ids: "{{ cme_query_result.cme_ids }}"
+
+    - name: Ensure report directory exists
+      ansible.builtin.file:
+        path: "{{ report_output_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Save dynamic profile to disk
+      ansible.builtin.copy:
+        content: |
+          ---
+          # Dynamic CME profile for {{ cve_id }}
+          # CVSS: {{ cvss_vector }}
+          # CWE: {{ cwe_ids | join(', ') }}
+          # Generated: {{ ansible_date_time.iso8601 }}
+          controls:
+          {% for cid in cme_dynamic_profile.controls %}
+            - {{ cid }}
+          {% endfor %}
+        dest: "{{ report_output_dir }}/cve_profile_{{ cve_id | replace('-', '_') }}.yml"
+        mode: "0644"
+
+###############################################################################
+# PHASE 2: PRE-REMEDIATION VERIFY
+###############################################################################
+- name: "CME PRE-Verify — Audit Current Posture"
+  hosts: targets
+  become: true
+  gather_facts: true
+  vars_files:
+    - ../vars/vault.yml
+  vars:
+    cme_results: []
+
+  tasks:
+    - name: Load dynamic profile from Phase 1
+      ansible.builtin.set_fact:
+        cme_target_controls: "{{ hostvars['localhost']['cme_dynamic_profile']['controls'] }}"
+
+    - name: Verify each control (read-only)
+      ansible.builtin.include_tasks:
+        file: _verify_cme_control.yml
+      loop: "{{ cme_target_controls }}"
+      loop_control:
+        loop_var: control_id
+
+    - name: Save PRE results
+      ansible.builtin.set_fact:
+        cme_pre_results: "{{ cme_results }}"
+        cme_pre_passed: "{{ cme_results | selectattr('status', 'equalto', 'passed') | list }}"
+        cme_pre_failed: "{{ cme_results | selectattr('status', 'equalto', 'failed') | list }}"
+
+    - name: Display PRE posture
+      ansible.builtin.debug:
+        msg: >-
+          PRE — {{ inventory_hostname }}:
+          {{ cme_pre_passed | length }} passed,
+          {{ cme_pre_failed | length }} failed
+          out of {{ cme_results | length }} controls
+
+###############################################################################
+# PHASE 3: REMEDIATE
+###############################################################################
+- name: "CME Remediate — Apply Compensating Controls"
+  hosts: targets
+  become: true
+  gather_facts: true
+  vars_files:
+    - ../vars/vault.yml
+
+  tasks:
+    - name: Load dynamic profile
+      ansible.builtin.set_fact:
+        cme_target_controls: "{{ hostvars['localhost']['cme_dynamic_profile']['controls'] }}"
+
+    - name: Apply each control
+      ansible.builtin.include_tasks:
+        file: _apply_cme_control.yml
+      loop: "{{ cme_target_controls }}"
+      loop_control:
+        loop_var: control_id
+
+###############################################################################
+# PERSIST PRE RESULTS FOR cme_verify.yml
+###############################################################################
+- name: "CME — Save PRE Results"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - ../vars/vault.yml
+
+  tasks:
+    - name: Collect PRE passed control IDs across all hosts
+      ansible.builtin.set_fact:
+        all_pre_active: >-
+          {{ groups['targets'] | map('extract', hostvars, 'cme_pre_passed')
+             | select('defined') | flatten
+             | map(attribute='cme_id') | unique | list }}
+
+    - name: Build PRE state payload
+      ansible.builtin.set_fact:
+        cme_pre_state_payload:
+          cve_id: "{{ demo_cve_id }}"
+          cvss_vector: "{{ demo_cvss_vector }}"
+          cwe_ids: "{{ demo_cwe_ids }}"
+          pre_active_controls: "{{ all_pre_active }}"
+          profile_controls: "{{ hostvars['localhost']['cme_dynamic_profile']['controls'] }}"
+          cme_ids: "{{ hostvars['localhost']['cme_dynamic_cme_ids'] }}"
+          timestamp: "{{ ansible_date_time.iso8601 | default(lookup('pipe', 'date -Iseconds')) }}"
+
+    - name: Save PRE state locally
+      ansible.builtin.copy:
+        content: "{{ cme_pre_state_payload | to_nice_json }}"
+        dest: "{{ report_output_dir }}/cme_pre_state_{{ demo_cve_id }}.json"
+        mode: "0644"
+
+    - name: Mitigation summary
+      ansible.builtin.debug:
+        msg: |
+          ═══════════════════════════════════════════════════════════
+            CME MITIGATION COMPLETE — {{ demo_cve_id }}
+          ═══════════════════════════════════════════════════════════
+           Controls queried:    {{ hostvars['localhost']['cme_dynamic_cme_ids'] | length }}
+           PRE active:          {{ all_pre_active | length }}
+           Remediation applied: {{ hostvars['localhost']['cme_dynamic_profile']['controls'] | length }} roles
+          ───────────────────────────────────────────────────────────
+           Next: Run cme_verify.yml to measure POST posture + CVSS attenuation
+          ═══════════════════════════════════════════════════════════
+
+- name: "Persist PRE State to Report Server"
+  hosts: builders
+  become: true
+  gather_facts: false
+  vars_files:
+    - ../vars/vault.yml
+
+  tasks:
+    - name: Ensure report web directory exists
+      ansible.builtin.file:
+        path: "{{ report_web_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Publish PRE state for verify phase
+      ansible.builtin.copy:
+        content: "{{ hostvars['localhost']['cme_pre_state_payload'] | to_nice_json }}"
+        dest: "{{ report_web_dir }}/cme_pre_state_{{ demo_cve_id }}.json"
+        mode: "0644"
+
+    - name: PRE state persisted
+      ansible.builtin.debug:
+        msg: "PRE state saved to {{ report_web_dir }}/cme_pre_state_{{ demo_cve_id }}.json"

@@ -1,0 +1,16 @@
+---
+name: CVE identifier
+description: Look up recommended CME compensating controls for a CVE
+spec:
+  - question_name: CVE Number
+    question_description: >-
+      CVE identifier to look up (for example CVE-2026-51234).
+      Demo catalog also includes CVE-2026-52891. Other CVEs are looked up from NVD.
+    required: true
+    type: text
+    variable: cve_id
+    min: 0
+    max: 32
+    default: CVE-2026-51234
+    choices: ""
+    new_question: true

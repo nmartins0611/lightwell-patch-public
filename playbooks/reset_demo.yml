@@ -1,0 +1,351 @@
+---
+# Reset Demo — Clean slate for a fresh demo walkthrough
+#
+# Clears RHTPA data (SBOMs + advisories), removes dynamic Controller
+# inventories, reverts CME controls applied to targets, clears local
+# reports, and restarts the CME MCP server.
+#
+# Usage:
+#   ansible-playbook playbooks/reset_demo.yml -i inventory/hosts.yml
+#
+# On AAP Controller, run with the Vault credential attached.
+
+###############################################################################
+# PHASE 1: CLEAR RHTPA — SBOMs and Advisories
+###############################################################################
+- name: "Reset — Clear RHTPA Data"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - ../vars/vault.yml
+
+  tasks:
+    - name: Acquire OIDC token from Keycloak
+      ansible.builtin.uri:
+        url: "{{ rhtpa_keycloak_url }}/realms/{{ rhtpa_keycloak_realm }}/protocol/openid-connect/token"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          client_id: "{{ rhtpa_oidc_client_id }}"
+          client_secret: "{{ rhtpa_oidc_client_secret }}"
+          grant_type: "client_credentials"
+          scope: "openid read:document delete:document"
+        status_code: [200]
+        validate_certs: false
+      register: token_response
+
+    - name: List all SBOMs in RHTPA
+      ansible.builtin.uri:
+        url: "{{ rhtpa_api_endpoint }}/api/v2/sbom?limit=100"
+        method: GET
+        headers:
+          Accept: "application/json"
+          Authorization: "Bearer {{ token_response.json.access_token }}"
+        status_code: [200]
+        validate_certs: false
+      register: sbom_list
+
+    - name: Delete each SBOM
+      ansible.builtin.uri:
+        url: "{{ rhtpa_api_endpoint }}/api/v2/sbom/{{ item.id }}"
+        method: DELETE
+        headers:
+          Authorization: "Bearer {{ token_response.json.access_token }}"
+        status_code: [200, 204, 404]
+        validate_certs: false
+      loop: "{{ sbom_list.json['items'] | default([]) }}"
+      loop_control:
+        label: "{{ item.name | default(item.id) }}"
+      when: sbom_list.json['total'] | int > 0
+
+    - name: List all advisories in RHTPA
+      ansible.builtin.uri:
+        url: "{{ rhtpa_api_endpoint }}/api/v2/advisory?limit=100"
+        method: GET
+        headers:
+          Accept: "application/json"
+          Authorization: "Bearer {{ token_response.json.access_token }}"
+        status_code: [200]
+        validate_certs: false
+      register: advisory_list
+
+    - name: Delete each advisory
+      ansible.builtin.uri:
+        url: "{{ rhtpa_api_endpoint }}/api/v2/advisory/{{ item.uuid }}"
+        method: DELETE
+        headers:
+          Authorization: "Bearer {{ token_response.json.access_token }}"
+        status_code: [200, 204, 404]
+        validate_certs: false
+      loop: "{{ advisory_list.json['items'] | default([]) }}"
+      loop_control:
+        label: "{{ item.document_id | default(item.id) }}"
+      when: advisory_list.json['total'] | int > 0
+
+    - name: RHTPA cleared
+      ansible.builtin.debug:
+        msg: >-
+          Deleted {{ sbom_list.json['total'] | default(0) }} SBOMs
+          and {{ advisory_list.json['total'] | default(0) }} advisories from RHTPA
+
+###############################################################################
+# PHASE 2: REMOVE DYNAMIC CONTROLLER INVENTORIES
+###############################################################################
+- name: "Reset — Remove Dynamic Controller Inventories"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - ../vars/vault.yml
+
+  tasks:
+    - name: Delete affected_hosts inventory for demo CVE
+      ansible.controller.inventory:
+        name: "affected_hosts-{{ demo_cve_id }}"
+        organization: "Default"
+        state: absent
+        controller_host: "{{ vault_controller_host }}"
+        controller_oauthtoken: "{{ vault_controller_token }}"
+        validate_certs: false
+      ignore_errors: true
+
+    - name: Controller inventories cleaned
+      ansible.builtin.debug:
+        msg: "Removed dynamic inventory affected_hosts-{{ demo_cve_id }}"
+
+###############################################################################
+# PHASE 3: REVERT CME CONTROLS ON TARGETS
+###############################################################################
+- name: "Reset — Revert Compensating Controls on Targets"
+  hosts: targets
+  become: true
+  gather_facts: true
+
+  tasks:
+    - name: Remove demo firewall rich rules
+      ansible.builtin.shell: |
+        for rule in $(firewall-cmd --list-rich-rules 2>/dev/null); do
+          firewall-cmd --permanent --remove-rich-rule="$rule" 2>/dev/null
+        done
+        firewall-cmd --reload 2>/dev/null
+      changed_when: true
+      failed_when: false
+
+    - name: Remove demo audit rules
+      ansible.builtin.shell: |
+        auditctl -D 2>/dev/null
+        truncate -s 0 /etc/audit/rules.d/cme-*.rules 2>/dev/null
+        rm -f /etc/audit/rules.d/cme-*.rules 2>/dev/null
+      changed_when: true
+      failed_when: false
+
+    - name: Clean up SBOM artifacts
+      ansible.builtin.file:
+        path: "{{ sbom_output_dir }}"
+        state: absent
+
+    - name: Target hosts reverted
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} — firewall rules cleared, audit rules removed, SBOM artifacts cleaned"
+
+###############################################################################
+# PHASE 4: WEAKEN CME CONTROLS FOR DEMO
+###############################################################################
+- name: "Reset — Weaken Controls to Show Remediation Delta"
+  hosts: targets
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: "CME-101 | Disable ASLR"
+      ansible.posix.sysctl:
+        name: kernel.randomize_va_space
+        value: "0"
+        state: present
+        reload: false
+
+    - name: "CME-108 | Expose kernel pointers"
+      ansible.posix.sysctl:
+        name: kernel.kptr_restrict
+        value: "0"
+        state: present
+        reload: false
+
+    - name: "CME-110 | Remove kexec_load_disabled from sysctl.conf"
+      ansible.builtin.lineinfile:
+        path: /etc/sysctl.conf
+        regexp: '^kernel\.kexec_load_disabled'
+        state: absent
+
+    - name: "CME-118 | Disable symlink/hardlink protection"
+      ansible.posix.sysctl:
+        name: "{{ item }}"
+        value: "0"
+        state: present
+        reload: false
+      loop:
+        - fs.protected_symlinks
+        - fs.protected_hardlinks
+
+    - name: "CME-603 | Allow unprivileged BPF"
+      ansible.posix.sysctl:
+        name: kernel.unprivileged_bpf_disabled
+        value: "0"
+        state: present
+        reload: false
+      failed_when: false
+
+    - name: "CME-604 | Allow unprivileged user namespaces"
+      ansible.posix.sysctl:
+        name: user.max_user_namespaces
+        value: "65536"
+        state: present
+        reload: false
+      failed_when: false
+
+    - name: "CME-903 | Disable TCP syncookies"
+      ansible.posix.sysctl:
+        name: net.ipv4.tcp_syncookies
+        value: "0"
+        state: present
+        reload: false
+
+    - name: "Reload sysctl (skip invalid entries)"
+      ansible.builtin.shell: sysctl -p 2>/dev/null || true
+      changed_when: false
+
+    - name: "CME-301 | Set SELinux to permissive (runtime only)"
+      ansible.builtin.command:
+        cmd: setenforce 0
+      changed_when: true
+      failed_when: false
+
+    - name: "CME-303 | Loosen SELinux boolean"
+      ansible.builtin.command:
+        cmd: setsebool -P httpd_can_network_connect on
+      changed_when: true
+      failed_when: false
+
+    - name: "CME-401 | Downgrade crypto policy to DEFAULT"
+      ansible.builtin.command:
+        cmd: update-crypto-policies --set DEFAULT
+      changed_when: true
+
+    - name: "CME-1002 | Disable auditd"
+      ansible.builtin.shell: auditctl -e 0 2>/dev/null || true
+      changed_when: true
+
+    - name: "CME-1101 | Stop automatic patching timer"
+      ansible.builtin.systemd:
+        name: dnf-automatic-install.timer
+        state: stopped
+        enabled: false
+      failed_when: false
+
+    - name: Controls weakened for demo
+      ansible.builtin.debug:
+        msg: |
+          Weakened controls on {{ inventory_hostname }}:
+            CME-101:  ASLR disabled (randomize_va_space=0)
+            CME-108:  Kernel pointers exposed (kptr_restrict=0)
+            CME-118:  Symlink/hardlink protection disabled
+            CME-301:  SELinux set to permissive (runtime)
+            CME-303:  SELinux booleans loosened
+            CME-401:  Crypto policy downgraded to DEFAULT
+            CME-603:  Unprivileged BPF allowed
+            CME-604:  Unprivileged user namespaces allowed
+            CME-903:  TCP syncookies disabled
+            CME-1002: Audit subsystem disabled
+            CME-1101: Automatic patching disabled
+          These will be remediated by CME Mitigate.
+
+###############################################################################
+# PHASE 5: CLEAR REPORTS AND RESTART CME
+###############################################################################
+- name: "Reset — Clear Reports and Restart CME"
+  hosts: builders
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Clear published reports from report server
+      ansible.builtin.shell: rm -f {{ report_web_dir }}/*.json {{ report_web_dir }}/*.html 2>/dev/null
+      changed_when: true
+      failed_when: false
+
+    - name: Restart CME MCP server (reseeds on startup)
+      containers.podman.podman_container:
+        name: cme-server
+        state: started
+        restart: true
+      ignore_errors: true
+
+    - name: Wait for CME server to be ready
+      ansible.builtin.uri:
+        url: "http://localhost:8000/mcp"
+        method: POST
+        body_format: json
+        headers:
+          Accept: "application/json, text/event-stream"
+        body:
+          jsonrpc: "2.0"
+          id: 0
+          method: initialize
+          params:
+            protocolVersion: "2025-03-26"
+            capabilities: {}
+            clientInfo:
+              name: health-check
+              version: "1.0"
+        status_code: [200]
+        timeout: 10
+      retries: 12
+      delay: 5
+      until: cme_ready.status == 200
+      register: cme_ready
+      ignore_errors: true
+
+    - name: Node2 services reset
+      ansible.builtin.debug:
+        msg: "Reports cleared, CME MCP server restarted"
+
+###############################################################################
+# PHASE 6: CLEAR LOCAL REPORTS
+###############################################################################
+- name: "Reset — Clear Local Report Artifacts"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  tasks:
+    - name: Remove local report directory
+      ansible.builtin.file:
+        path: "{{ report_output_dir }}"
+        state: absent
+
+    - name: Remove fetched SBOM directory
+      ansible.builtin.file:
+        path: "{{ sbom_output_dir }}/fetched"
+        state: absent
+
+    - name: Demo reset complete
+      ansible.builtin.debug:
+        msg: |
+          ═══════════════════════════════════════════════════════════
+                         DEMO RESET COMPLETE
+          ═══════════════════════════════════════════════════════════
+           RHTPA:      All SBOMs and advisories deleted
+           Controller: Dynamic inventories removed
+           Targets:    Firewall and audit rules reverted
+           Controls:   11 controls weakened for demo delta
+           Node2:      Reports cleared, CME MCP restarted
+           Local:      Report artifacts cleaned
+          ───────────────────────────────────────────────────────────
+           Ready to start fresh. Next step:
+             1. Run SBOM Scan and Upload   (scan + upload + advisory)
+             2. Run CVE Correlation        (map CVE to inventory)
+             3. Run AI CVE Triage          (risk assessment)
+             4. Run CME Mitigate           (apply compensating controls)
+             5. Run CME Verify             (posture report + scoring)
+          ═══════════════════════════════════════════════════════════

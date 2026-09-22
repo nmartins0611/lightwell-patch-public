@@ -1,0 +1,65 @@
+---
+- name: CVE Lifecycle — Lightwell + AAP Demo
+  hosts: all
+  sources:
+    - ansible.eda.webhook:
+        host: 0.0.0.0
+        port: "{{ eda_webhook_port | default(5000) }}"
+
+  rules:
+    - name: CVE disclosed — no fix available yet
+      condition: event.payload.type == "cve_disclosure"
+      action:
+        run_workflow_template:
+          name: "SBOM Correlate and Mitigate"
+          organization: "Default"
+          job_args:
+            extra_vars:
+              cve_id: "{{ event.payload.cve_id }}"
+              cvss_vector: "{{ event.payload.cvss_vector }}"
+              cwe_ids: "{{ event.payload.cwe_ids }}"
+              affected_package: "{{ event.payload.affected_package }}"
+              affected_version_range: "{{ event.payload.affected_version_range }}"
+
+    - name: RHSA available — Lightwell resolved the CVE (OS package)
+      condition: event.payload.type == "rhsa_available"
+      action:
+        run_workflow_template:
+          name: "Patch Test and Deploy"
+          organization: "Default"
+          job_args:
+            extra_vars:
+              cve_id: "{{ event.payload.cve_id }}"
+              advisory_id: "{{ event.payload.advisory_id }}"
+              fixed_package: "{{ event.payload.fixed_package }}"
+              fixed_version: "{{ event.payload.fixed_version }}"
+
+    - name: App dependency fix — Lightwell resolved via CI/CD rebuild
+      condition: event.payload.type == "app_dependency_fix"
+      action:
+        run_workflow_template:
+          name: "App Dependency Remediate"
+          organization: "Default"
+          job_args:
+            extra_vars:
+              cve_id: "{{ event.payload.cve_id }}"
+              affected_library: "{{ event.payload.affected_library }}"
+              fixed_version: "{{ event.payload.fixed_version }}"
+              app_name: "{{ event.payload.app_name }}"
+              app_repo: "{{ event.payload.app_repo }}"
+              remediation_mode: "{{ event.payload.remediation_mode }}"
+
+    - name: App dependency fix — Lightwell resolved via GitOps PR
+      condition: event.payload.type == "app_dependency_fix_gitops"
+      action:
+        run_workflow_template:
+          name: "App GitOps Remediate"
+          organization: "Default"
+          job_args:
+            extra_vars:
+              cve_id: "{{ event.payload.cve_id }}"
+              affected_library: "{{ event.payload.affected_library }}"
+              fixed_version: "{{ event.payload.fixed_version }}"
+              app_name: "{{ event.payload.app_name }}"
+              app_repo: "{{ event.payload.app_repo }}"
+              target_branch: "{{ event.payload.target_branch }}"

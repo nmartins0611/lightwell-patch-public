@@ -1,0 +1,33 @@
+---
+# Copy this file to vars/vault.yml, replace every CHANGE_ME value with
+# credentials for YOUR lab, then encrypt:
+#
+#   cp vars/vault.example.yml vars/vault.yml
+#   ansible-vault encrypt vars/vault.yml
+#
+# Never commit vars/vault.yml.
+
+vault_ansible_user: "CHANGE_ME"
+vault_ssh_password: "CHANGE_ME"
+vault_ssh_key_path: "~/.ssh/id_ed25519"
+
+vault_controller_host: "https://aap.example.com"
+vault_controller_username: "admin"
+vault_controller_password: "CHANGE_ME"
+vault_controller_token: "CHANGE_ME"
+
+vault_registry_username: "CHANGE_ME"
+vault_registry_password: "CHANGE_ME"
+
+vault_gitea_admin_password: "CHANGE_ME"
+vault_gitea_api_token: "CHANGE_ME"
+
+vault_keycloak_admin_password: "CHANGE_ME"
+vault_keycloak_demo_password: "CHANGE_ME"
+vault_rhtpa_oidc_client_secret: "CHANGE_ME"
+
+vault_pg_admin_password: "CHANGE_ME"
+vault_pg_db_password: "CHANGE_ME"
+
+vault_splunk_host: "splunk.example.com"
+vault_splunk_hec_token: "CHANGE_ME"

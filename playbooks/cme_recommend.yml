@@ -1,0 +1,217 @@
+---
+# Operator lookup: CVE ID in (AAP survey or extra var) → recommended CME
+# controls as a job report (HTML/JSON) on the report server.
+# Does not apply or verify controls. Use CME Mitigate to apply them.
+
+- name: "CME Recommend — Controls for a CVE"
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  vars_files:
+    - ../vars/vault.yml
+  vars:
+    # Literals only. Implicit localhost does not receive Demo Fleet group_vars,
+    # so catalog entries must not reference {{ demo_* }}.
+    cme_cve_catalog:
+      CVE-2026-51234:
+        cvss_vector: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H"
+        cwe_ids:
+          - "CWE-119"
+          - "CWE-787"
+        source: "Demo catalog (python-cryptography)"
+        description: "Memory corruption in python-cryptography"
+      CVE-2026-52891:
+        cvss_vector: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+        cwe_ids:
+          - "CWE-502"
+        source: "Demo catalog (pyyaml)"
+        description: "Unsafe deserialization in pyyaml"
+
+  tasks:
+    - name: Require a CVE identifier
+      ansible.builtin.assert:
+        that:
+          - cve_id is defined
+          - (cve_id | trim | length) > 0
+        fail_msg: >-
+          Pass cve_id via the job template survey or as an extra var
+          (for example CVE-2026-51234).
+
+    - name: Normalize CVE identifier
+      ansible.builtin.set_fact:
+        cve_lookup_id: "{{ cve_id | trim | upper }}"
+
+    - name: Resolve CVE from the demo catalog
+      ansible.builtin.set_fact:
+        cve_in_catalog: "{{ (cve_lookup_id in cme_cve_catalog) | bool }}"
+        catalog_entry: "{{ cme_cve_catalog[cve_lookup_id] | default({}) }}"
+
+    - name: Query NVD for CVE details
+      ansible.builtin.uri:
+        url: "https://services.nvd.nist.gov/rest/json/cves/2.0?cveId={{ cve_lookup_id }}"
+        method: GET
+        headers:
+          Accept: "application/json"
+          User-Agent: "lightwell-patch-demo/cme-recommend"
+        status_code:
+          - 200
+          - 403
+          - 404
+        timeout: 15
+        validate_certs: true
+      register: nvd_response
+      ignore_errors: true
+      when: not (cve_in_catalog | bool)
+
+    - name: Query Red Hat Security Data API
+      ansible.builtin.uri:
+        url: "https://access.redhat.com/hydra/rest/securitydata/cve/{{ cve_lookup_id }}.json"
+        method: GET
+        headers:
+          Accept: "application/json"
+        status_code:
+          - 200
+          - 404
+        timeout: 15
+        validate_certs: true
+      register: rh_response
+      ignore_errors: true
+      when: not (cve_in_catalog | bool)
+
+    - name: Extract NVD CVSS vector and CWE IDs
+      ansible.builtin.set_fact:
+        nvd_cve: "{{ nvd_response.json.vulnerabilities[0].cve | default({}) }}"
+      when:
+        - not (cve_in_catalog | bool)
+        - nvd_response.status | default(0) == 200
+        - (nvd_response.json.vulnerabilities | default([])) | length > 0
+
+    - name: Set NVD-derived intelligence
+      ansible.builtin.set_fact:
+        nvd_cvss_vector: "{{ ((nvd_cve.metrics.cvssMetricV31 | default([]))[0].cvssData.vectorString if (nvd_cve.metrics.cvssMetricV31 | default([])) | length > 0 else ((nvd_cve.metrics.cvssMetricV30 | default([]))[0].cvssData.vectorString if (nvd_cve.metrics.cvssMetricV30 | default([])) | length > 0 else '')) | trim }}"
+        nvd_base_score: "{{ ((nvd_cve.metrics.cvssMetricV31 | default([]))[0].cvssData.baseScore if (nvd_cve.metrics.cvssMetricV31 | default([])) | length > 0 else '') }}"
+        nvd_severity: "{{ ((nvd_cve.metrics.cvssMetricV31 | default([]))[0].cvssData.baseSeverity if (nvd_cve.metrics.cvssMetricV31 | default([])) | length > 0 else '') }}"
+        nvd_cwe_ids: "{{ nvd_cve.weaknesses | default([]) | map(attribute='description') | flatten | selectattr('value', 'match', '^CWE-[0-9]+') | map(attribute='value') | unique | list }}"
+        nvd_description: "{{ (nvd_cve.descriptions | default([]) | selectattr('lang', 'equalto', 'en') | map(attribute='value') | list | first) | default('') }}"
+      when: nvd_cve is defined
+
+    - name: Set Red Hat-derived intelligence
+      ansible.builtin.set_fact:
+        rh_cvss_vector: "{{ rh_response.json.cvss3.cvss3_scoring_vector | default('') | trim }}"
+        rh_cwe_ids: "{{ [rh_response.json.CWE] if (rh_response.json.CWE is defined and rh_response.json.CWE is string) else (rh_response.json.CWE | default([])) }}"
+      when:
+        - not (cve_in_catalog | bool)
+        - rh_response.status | default(0) == 200
+
+    - name: Select CVSS vector and CWE IDs
+      ansible.builtin.set_fact:
+        resolved_cvss_vector: "{{ (catalog_entry.cvss_vector if (cve_in_catalog | bool) else (nvd_cvss_vector | default('') if (nvd_cvss_vector | default('')) | length > 0 else (rh_cvss_vector | default('')))) | trim }}"
+        resolved_cwe_ids: "{{ catalog_entry.cwe_ids if (cve_in_catalog | bool) else (nvd_cwe_ids | default([]) if (nvd_cwe_ids | default([])) | length > 0 else (rh_cwe_ids | default([]))) }}"
+        intel_source: "{{ catalog_entry.source if (cve_in_catalog | bool) else ('NVD' if (nvd_cvss_vector | default('')) | length > 0 else ('Red Hat Security Data' if (rh_cvss_vector | default('')) | length > 0 else 'none')) }}"
+        cve_description: "{{ catalog_entry.description if (cve_in_catalog | bool) else (nvd_description | default('')) }}"
+        resolved_base_score: "{{ nvd_base_score | default('') }}"
+        resolved_severity: "{{ nvd_severity | default('') }}"
+
+    - name: Normalize CWE identifiers
+      ansible.builtin.set_fact:
+        resolved_cwe_ids: "{{ resolved_cwe_ids | map('regex_replace', '^(?:CWE-)?', 'CWE-') | list }}"
+
+    - name: Require CVSS vector or CWE IDs for the CME query
+      ansible.builtin.assert:
+        that:
+          - (resolved_cvss_vector | length > 0) or (resolved_cwe_ids | length > 0)
+        fail_msg: >-
+          No CVSS vector or CWE IDs found for {{ cve_lookup_id }}.
+          Add it to the demo catalog or use a CVE published in NVD or
+          Red Hat Security Data.
+
+    - name: Query CME MCP for recommended controls
+      cme.controls.cme_query:
+        cvss_vector: "{{ resolved_cvss_vector }}"
+        cwe_ids: "{{ resolved_cwe_ids }}"
+        mcp_endpoint: "{{ cme_mcp_endpoint }}"
+        include_verification: false
+      register: cme_query_result
+
+    - name: Calculate projected attenuation if recommended controls are active
+      cme.controls.cme_score:
+        active_controls: "{{ cme_query_result.cme_ids }}"
+        mcp_endpoint: "{{ cme_mcp_endpoint }}"
+        base_score: "{{ resolved_base_score if (resolved_base_score | string | length > 0) else omit }}"
+        base_vector: "{{ resolved_cvss_vector if (resolved_cvss_vector | length > 0) else omit }}"
+      register: cme_projected_score
+      when: cme_query_result.cme_ids | length > 0
+
+    - name: Build recommendation report
+      ansible.builtin.set_fact:
+        recommend_report:
+          cve_id: "{{ cve_lookup_id }}"
+          description: "{{ cve_description }}"
+          cvss_vector: "{{ resolved_cvss_vector }}"
+          cwe_ids: "{{ resolved_cwe_ids }}"
+          base_score: "{{ resolved_base_score }}"
+          severity: "{{ resolved_severity }}"
+          intel_source: "{{ intel_source }}"
+          controls: "{{ cme_query_result.controls }}"
+          query_summary: "{{ cme_query_result.query_summary }}"
+          attenuation: "{{ cme_projected_score.attenuation | default([]) }}"
+          simulation: "{{ cme_projected_score.simulation | default({}) }}"
+          timestamp: "{{ ansible_date_time.iso8601 }}"
+
+    - name: Display recommended CME controls
+      ansible.builtin.debug:
+        msg: |
+          ═══════════════════════════════════════════════════════════
+           CME RECOMMENDED CONTROLS — {{ cve_lookup_id }}
+          ═══════════════════════════════════════════════════════════
+           Source:  {{ intel_source }}
+           CVSS:    {{ resolved_cvss_vector | default('N/A') }}
+           CWE:     {{ resolved_cwe_ids | join(', ') if resolved_cwe_ids | length > 0 else 'N/A' }}
+           Matches: {{ cme_query_result.cme_ids | length }}
+             ({{ cme_query_result.query_summary.matched_by_vector }} by vector,
+              {{ cme_query_result.query_summary.matched_by_cwe }} by CWE)
+          ───────────────────────────────────────────────────────────
+          {% for c in cme_query_result.controls %}
+           {{ c.cme_id }}  {{ c.control_name }}  [{{ c.matched_via }}]
+          {% endfor %}
+          ═══════════════════════════════════════════════════════════
+           Next: launch CME Mitigate to apply these controls.
+          ═══════════════════════════════════════════════════════════
+
+- name: "Publish recommendation report to report server"
+  hosts: builders
+  become: true
+  gather_facts: false
+  ignore_unreachable: true
+  vars_files:
+    - ../vars/vault.yml
+  vars:
+    cve_lookup_id: "{{ hostvars['localhost']['cve_lookup_id'] }}"
+    recommend_report: "{{ hostvars['localhost']['recommend_report'] }}"
+
+  tasks:
+    - name: Ensure report web directory exists
+      ansible.builtin.file:
+        path: "{{ report_web_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Publish recommendation report (JSON)
+      ansible.builtin.copy:
+        content: "{{ recommend_report | to_nice_json }}"
+        dest: "{{ report_web_dir }}/cve-recommend-{{ cve_lookup_id }}.json"
+        mode: "0644"
+
+    - name: Publish recommendation report (HTML)
+      ansible.builtin.template:
+        src: ../templates/cve_recommend_report.html.j2
+        dest: "{{ report_web_dir }}/cve-recommend-{{ cve_lookup_id }}.html"
+        mode: "0644"
+      vars:
+        report: "{{ recommend_report }}"
+
+    - name: Reports published
+      ansible.builtin.debug:
+        msg: >-
+          Report: {{ report_server_url }}/cve-recommend-{{ cve_lookup_id }}.html
+          Next: launch CME Mitigate to apply the recommended controls.

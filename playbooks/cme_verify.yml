@@ -1,0 +1,243 @@
+---
+# Demo 2, Phase 2: CME Verify — POST-Remediation Verification + CVSS Scoring
+#
+# Loads the dynamic profile and PRE results saved by cme_mitigate.yml,
+# runs POST verification across the fleet, calculates CVSS attenuation
+# via the CME MCP server, and generates a posture report showing the
+# before/after risk reduction.
+#
+# Triggered by: EDA workflow (after cme_mitigate completes)
+
+###############################################################################
+# PHASE 1: LOAD PRE STATE
+###############################################################################
+- name: "CME — Load Pre-Mitigation State"
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  vars_files:
+    - ../vars/vault.yml
+
+  tasks:
+    - name: Fetch PRE state from report server
+      ansible.builtin.uri:
+        url: "{{ report_server_url }}/cme_pre_state_{{ demo_cve_id }}.json"
+        return_content: true
+        validate_certs: false
+      register: pre_state_raw
+
+    - name: Parse PRE state
+      ansible.builtin.set_fact:
+        cme_pre_state: "{{ pre_state_raw.content | from_json }}"
+
+    - name: Restore dynamic profile
+      ansible.builtin.set_fact:
+        cme_dynamic_profile:
+          controls: "{{ cme_pre_state.profile_controls }}"
+        cme_dynamic_cme_ids: "{{ cme_pre_state.cme_ids }}"
+        cme_all_pre_active: "{{ cme_pre_state.pre_active_controls }}"
+
+    - name: Display loaded state
+      ansible.builtin.debug:
+        msg: >-
+          Loaded PRE state for {{ demo_cve_id }}:
+          {{ cme_pre_state.profile_controls | length }} controls,
+          {{ cme_pre_state.pre_active_controls | length }} were active before remediation
+
+###############################################################################
+# PHASE 2: POST-REMEDIATION VERIFY
+###############################################################################
+- name: "CME POST-Verify — Audit Remediated Posture"
+  hosts: targets
+  become: true
+  gather_facts: true
+  vars_files:
+    - ../vars/vault.yml
+  vars:
+    cme_results: []
+
+  tasks:
+    - name: Load dynamic profile
+      ansible.builtin.set_fact:
+        cme_target_controls: "{{ hostvars['localhost']['cme_dynamic_profile']['controls'] }}"
+
+    - name: Verify each control (read-only)
+      ansible.builtin.include_tasks:
+        file: _verify_cme_control.yml
+      loop: "{{ cme_target_controls }}"
+      loop_control:
+        loop_var: control_id
+
+    - name: Save POST results
+      ansible.builtin.set_fact:
+        cme_post_results: "{{ cme_results }}"
+        cme_post_passed: "{{ cme_results | selectattr('status', 'equalto', 'passed') | list }}"
+        cme_post_failed: "{{ cme_results | selectattr('status', 'equalto', 'failed') | list }}"
+
+    - name: Calculate remediation gains
+      ansible.builtin.set_fact:
+        cme_newly_passed: >-
+          {{ (cme_post_passed | map(attribute='cme_id') | list)
+             | difference(hostvars['localhost']['cme_all_pre_active']) }}
+
+    - name: Display POST posture
+      ansible.builtin.debug:
+        msg: >-
+          POST — {{ inventory_hostname }}:
+          {{ cme_post_passed | length }}/{{ cme_post_results | length }} controls active
+          (+{{ cme_newly_passed | length }} remediated)
+
+###############################################################################
+# PHASE 3: CVSS SCORE ATTENUATION + REPORT
+###############################################################################
+- name: "CME Score — CVSS Attenuation and Posture Report"
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  vars_files:
+    - ../vars/vault.yml
+  vars:
+    cve_id: "{{ demo_cve_id }}"
+    cvss_vector: "{{ demo_cvss_vector }}"
+
+  tasks:
+    - name: Collect POST active control IDs across all hosts
+      ansible.builtin.set_fact:
+        all_post_active: >-
+          {{ groups['targets'] | map('extract', hostvars, 'cme_post_passed')
+             | select('defined') | flatten
+             | map(attribute='cme_id') | unique | list }}
+
+    - name: Collect newly remediated controls
+      ansible.builtin.set_fact:
+        all_newly_passed: >-
+          {{ groups['targets'] | map('extract', hostvars, 'cme_newly_passed')
+             | select('defined') | flatten | unique | list }}
+
+    - name: Calculate PRE attenuation score
+      cme.controls.cme_score:
+        active_controls: "{{ cme_all_pre_active }}"
+        mcp_endpoint: "{{ cme_mcp_endpoint }}"
+        base_score: 10.0
+        base_vector: "{{ cvss_vector }}"
+      register: pre_score
+
+    - name: Calculate POST attenuation score
+      cme.controls.cme_score:
+        active_controls: "{{ all_post_active }}"
+        mcp_endpoint: "{{ cme_mcp_endpoint }}"
+        base_score: 10.0
+        base_vector: "{{ cvss_vector }}"
+      register: post_score
+
+    - name: Build posture report
+      ansible.builtin.set_fact:
+        posture_report:
+          cve_id: "{{ cve_id }}"
+          report_type: "cme_posture_report"
+          cvss_vector: "{{ cvss_vector }}"
+          cwe_ids: "{{ demo_cwe_ids }}"
+          hosts_assessed: "{{ groups['targets'] | length }}"
+          controls_evaluated: "{{ cme_dynamic_cme_ids | length }}"
+          pre_remediation:
+            active_controls: "{{ cme_all_pre_active | length }}"
+            attenuation: "{{ pre_score.attenuation | default([]) }}"
+            simulation: "{{ pre_score.simulation | default({}) }}"
+          post_remediation:
+            active_controls: "{{ all_post_active | length }}"
+            newly_remediated: "{{ all_newly_passed | length }}"
+            attenuation: "{{ post_score.attenuation | default([]) }}"
+            simulation: "{{ post_score.simulation | default({}) }}"
+          recommendation: >-
+            {{ 'Compensating controls in place. Monitor for exploitation indicators. Patch when RHSA becomes available.'
+               if all_post_active | length > 0
+               else 'No active mitigations. Immediate patching required.' }}
+          timestamp: "{{ ansible_date_time.iso8601 }}"
+
+    - name: Ensure report directory exists
+      ansible.builtin.file:
+        path: "{{ report_output_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Write posture report (JSON)
+      ansible.builtin.copy:
+        content: "{{ posture_report | to_nice_json }}"
+        dest: "{{ report_output_dir }}/posture-report-{{ cve_id }}.json"
+        mode: "0644"
+
+    - name: Write posture report (HTML)
+      ansible.builtin.template:
+        src: ../templates/posture_report.html.j2
+        dest: "{{ report_output_dir }}/posture-report-{{ cve_id }}.html"
+        mode: "0644"
+      vars:
+        report: "{{ posture_report }}"
+
+    - name: Display CVE response summary
+      ansible.builtin.debug:
+        msg: |
+          ═══════════════════════════════════════════════════════════
+                    CME POSTURE REPORT — {{ cve_id }}
+          ═══════════════════════════════════════════════════════════
+           CVSS:    {{ cvss_vector }}
+           CWE:     {{ demo_cwe_ids | join(', ') }}
+           Hosts:   {{ groups['targets'] | length }}
+          ───────────────────────────────────────────────────────────
+           POSTURE:
+             PRE:     {{ cme_all_pre_active | length }} controls active
+             POST:    {{ all_post_active | length }} controls active
+             GAINED:  +{{ all_newly_passed | length }} remediated
+          ───────────────────────────────────────────────────────────
+           CVSS ATTENUATION:
+             PRE:  {{ pre_score.attenuation | default([]) | length }} metrics attenuated
+          {% for a in (pre_score.attenuation | default([])) %}
+                   {{ a.metric }}: → {{ a.modified_to }}  ({{ a.contributing_controls | length }} controls)
+          {% endfor %}
+             POST: {{ post_score.attenuation | default([]) | length }} metrics attenuated
+          {% for a in (post_score.attenuation | default([])) %}
+                   {{ a.metric }}: → {{ a.modified_to }}  ({{ a.contributing_controls | length }} controls)
+          {% endfor %}
+          ───────────────────────────────────────────────────────────
+           SIMULATION:
+             Original:  {{ pre_score.simulation.original.score | default('10.0') }} ({{ pre_score.simulation.original.severity | default('Critical') }})
+             Modified:  {{ post_score.simulation.modified.score | default('N/A') }} ({{ post_score.simulation.modified.severity | default('N/A') }})
+             Changes:   {{ post_score.simulation.modifications_applied | default(0) }} vector modifications
+          ═══════════════════════════════════════════════════════════
+
+- name: "Publish Posture Report to Report Server"
+  hosts: builders
+  become: true
+  gather_facts: false
+  vars_files:
+    - ../vars/vault.yml
+  vars:
+    cve_id: "{{ demo_cve_id }}"
+
+  tasks:
+    - name: Ensure report web directory exists
+      ansible.builtin.file:
+        path: "{{ report_web_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Publish posture report (JSON)
+      ansible.builtin.copy:
+        content: "{{ hostvars['localhost']['posture_report'] | to_nice_json }}"
+        dest: "{{ report_web_dir }}/posture-report-{{ cve_id }}.json"
+        mode: "0644"
+
+    - name: Publish posture report (HTML)
+      ansible.builtin.template:
+        src: ../templates/posture_report.html.j2
+        dest: "{{ report_web_dir }}/posture-report-{{ cve_id }}.html"
+        mode: "0644"
+      vars:
+        report: "{{ hostvars['localhost']['posture_report'] }}"
+
+    - name: Reports published
+      ansible.builtin.debug:
+        msg: >-
+          Reports available at
+          {{ report_server_url }}/posture-report-{{ cve_id }}.html (HTML)
+          {{ report_server_url }}/posture-report-{{ cve_id }}.json (JSON)

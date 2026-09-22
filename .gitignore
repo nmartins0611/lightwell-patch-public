@@ -1,0 +1,28 @@
+# Local Ansible Vault — never commit the real file
+vars/vault.yml
+inventory/**/vault.yml
+inventory/**/*vault*
+
+# Environment files
+.env
+.env.*
+
+# TLS certificates and keys
+certs/
+
+# Ansible artifacts
+*.retry
+/tmp/
+__pycache__/
+
+# SBOM and report outputs
+/sbom-artifacts/
+/demo-reports/
+
+# EE build context
+execution-environment/context/
+
+# OS
+.DS_Store
+*.swp
+*.swo

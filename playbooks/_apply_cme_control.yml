@@ -1,0 +1,10 @@
+---
+- name: "Apply control {{ control_id }}"
+  block:
+    - name: "Include role {{ control_id }}"
+      ansible.builtin.include_role:
+        name: "cme.controls.{{ control_id }}"
+  rescue:
+    - name: "Skip {{ control_id }} — unsupported on {{ ansible_os_family }}"
+      ansible.builtin.debug:
+        msg: "Control {{ control_id }} remediation skipped (platform: {{ ansible_os_family }})"

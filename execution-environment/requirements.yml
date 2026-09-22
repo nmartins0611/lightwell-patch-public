@@ -1,0 +1,8 @@
+---
+collections:
+  - name: ansible.eda
+  - name: ansible.controller
+  - name: redhat.rhel_system_roles
+  - name: community.general
+  - name: ansible.posix
+  - name: containers.podman

@@ -1,0 +1,120 @@
+---
+# Demo 1, Phase 1: SBOM Scan and Upload to RHTPA
+#
+# Scans targets with Syft to produce CycloneDX SBOMs, then uploads
+# each SBOM to RHTPA via the BOMbastic API.
+#
+# Triggered by: EDA (cve_disclosure event) or scheduled (pre-demo baseline)
+
+- name: "SBOM Scan — Generate CycloneDX on targets"
+  hosts: targets
+  gather_facts: true
+  vars_files:
+    - ../vars/vault.yml
+  vars:
+    sbom_format: "cyclonedx-json@1.6"
+    sbom_output: "{{ sbom_output_dir }}/{{ ansible_host }}-sbom.json"
+
+  tasks:
+    - name: Ensure output directory exists
+      ansible.builtin.file:
+        path: "{{ sbom_output_dir }}"
+        state: directory
+        mode: "0750"
+
+    - name: Run Syft SBOM scan (Python packages)
+      ansible.builtin.command:
+        cmd: >-
+          syft scan dir:/usr/lib64/python3.9
+          --source-name {{ ansible_host }}
+          --output {{ sbom_format }}={{ sbom_output }}
+      changed_when: true
+
+    - name: Fetch SBOM to controller
+      ansible.builtin.fetch:
+        src: "{{ sbom_output }}"
+        dest: "{{ sbom_output_dir }}/fetched/"
+        flat: false
+
+- name: "SBOM Upload — Push to RHTPA API"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - ../vars/vault.yml
+  vars:
+    fetched_sbom_dir: "{{ sbom_output_dir }}/fetched"
+
+  tasks:
+    - name: Acquire OIDC token from Keycloak
+      ansible.builtin.uri:
+        url: "{{ rhtpa_keycloak_url }}/realms/{{ rhtpa_keycloak_realm }}/protocol/openid-connect/token"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          client_id: "{{ rhtpa_oidc_client_id }}"
+          client_secret: "{{ rhtpa_oidc_client_secret }}"
+          grant_type: "client_credentials"
+          scope: "openid create:document read:document"
+        status_code: [200]
+        validate_certs: false
+      register: token_response
+
+    - name: Find all fetched SBOMs
+      ansible.builtin.find:
+        paths: "{{ fetched_sbom_dir }}"
+        patterns: "*-sbom.json"
+        recurse: true
+      register: sbom_files
+
+    - name: Upload each SBOM to RHTPA
+      ansible.builtin.uri:
+        url: "{{ rhtpa_sbom_endpoint }}"
+        method: POST
+        src: "{{ item.path }}"
+        headers:
+          Content-Type: "application/json"
+          Accept: "application/json"
+          Authorization: "Bearer {{ token_response.json.access_token }}"
+        status_code: [200, 201, 202]
+        timeout: 120
+        validate_certs: false
+      loop: "{{ sbom_files.files }}"
+      loop_control:
+        label: "{{ item.path | basename }}"
+      register: upload_results
+
+    - name: Report upload status
+      ansible.builtin.debug:
+        msg: "Uploaded {{ upload_results.results | length }} SBOMs to RHTPA"
+
+    - name: Check if demo advisory already exists
+      ansible.builtin.uri:
+        url: "{{ rhtpa_api_endpoint }}/api/v2/advisory"
+        method: GET
+        headers:
+          Accept: "application/json"
+          Authorization: "Bearer {{ token_response.json.access_token }}"
+        status_code: [200]
+        validate_certs: false
+      register: advisory_check
+
+    - name: Upload mock CVE advisory to RHTPA
+      ansible.builtin.uri:
+        url: "{{ rhtpa_api_endpoint }}/api/v2/advisory"
+        method: POST
+        src: "{{ playbook_dir }}/../demo/mock_vex_cve-2026-51234.json"
+        headers:
+          Content-Type: "application/json"
+          Authorization: "Bearer {{ token_response.json.access_token }}"
+        status_code: [200, 201, 202]
+        validate_certs: false
+      when: advisory_check.json.total | int == 0
+      register: advisory_upload
+
+    - name: Advisory upload status
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'Advisory RHSA-2026:4521 uploaded to RHTPA'
+             if advisory_upload is changed else
+             'Advisory already present in RHTPA (' ~ advisory_check.json.total ~ ' advisories)' }}

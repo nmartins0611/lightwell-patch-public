@@ -1,0 +1,206 @@
+---
+# Demo 4a: App Dependency Remediation — CI/CD Direct Path (Gitea)
+#
+# Lightwell publishes a fixed library version. This playbook orchestrates
+# the full rebuild pipeline: update dependency spec → trigger Gitea Actions
+# build → wait for workflow run → deploy rebuilt application → validate health.
+#
+# KEY DISTINCTION: App dependencies are a BUILD-TIME fix, not deploy-time.
+# Unlike OS packages (dnf update on live system), application libraries are
+# baked into the application. Remediation goes through CI/CD, not package manager.
+#
+# Triggered by: EDA (app_dependency_fix event)
+
+- name: "App Dependency Fix — CI/CD Rebuild Pipeline"
+  hosts: localhost
+  vars_files:
+    - ../vars/vault.yml
+  connection: local
+  gather_facts: true
+  vars:
+    cve_id: "{{ demo_app_cve_id }}"
+    affected_library: "{{ demo_app_affected_library }}"
+    fixed_version: "{{ demo_app_fixed_version }}"
+    app_name: "{{ demo_app_name }}"
+    dependency_file: "{{ demo_app_dependency_file }}"
+    gitea_url: "{{ demo_gitea_url }}"
+    gitea_api: "{{ demo_gitea_url }}/api/v1"
+    gitea_owner: "{{ demo_gitea_owner }}"
+    gitea_repo: "{{ demo_app_name }}"
+    gitea_token: "{{ vault_gitea_api_token }}"
+    lightwell_index_url: "{{ demo_lightwell_pypi_url }}"
+    target_branch: "{{ demo_app_target_branch | default('main') }}"
+
+  tasks:
+    - name: "Phase 1 — Update dependency in Gitea via API"
+      block:
+        - name: Read current requirements.txt from Gitea
+          ansible.builtin.uri:
+            url: "{{ gitea_api }}/repos/{{ gitea_owner }}/{{ gitea_repo }}/contents/{{ dependency_file }}"
+            method: GET
+            headers:
+              Authorization: "token {{ gitea_token }}"
+              Accept: "application/json"
+            status_code: [200]
+          register: dep_file
+
+        - name: Decode current file content
+          ansible.builtin.set_fact:
+            current_deps: "{{ dep_file.json.content | b64decode }}"
+            file_sha: "{{ dep_file.json.sha }}"
+
+        - name: Build updated requirements content
+          ansible.builtin.set_fact:
+            updated_deps: "{{ current_deps | regex_replace(affected_library + '[=<>~!][^\\n]*', affected_library + '==' + fixed_version) }}"
+
+        - name: Commit dependency update via Gitea API
+          ansible.builtin.uri:
+            url: "{{ gitea_api }}/repos/{{ gitea_owner }}/{{ gitea_repo }}/contents/{{ dependency_file }}"
+            method: PUT
+            headers:
+              Authorization: "token {{ gitea_token }}"
+              Content-Type: "application/json"
+            body_format: json
+            body:
+              message: "fix(security): update {{ affected_library }} to {{ fixed_version }}\n\nResolves {{ cve_id }} via Lightwell-published fix.\nSource: {{ lightwell_index_url }}"
+              content: "{{ updated_deps | b64encode }}"
+              sha: "{{ file_sha }}"
+              branch: "{{ target_branch }}"
+              committer:
+                name: "AAP Security Automation"
+                email: "aap-security@example.com"
+            status_code: [200]
+          register: commit_result
+
+        - name: Display commit
+          ansible.builtin.debug:
+            msg: "Committed: {{ commit_result.json.commit.html_url | default('OK') }}"
+
+    - name: "Phase 2 — Wait for Gitea Actions workflow to complete"
+      block:
+        - name: Wait for workflow run to appear
+          ansible.builtin.uri:
+            url: "{{ gitea_api }}/repos/{{ gitea_owner }}/{{ gitea_repo }}/actions/runs"
+            method: GET
+            headers:
+              Authorization: "token {{ gitea_token }}"
+            status_code: [200]
+          register: workflow_runs
+          retries: 10
+          delay: 5
+          until: workflow_runs.json.workflow_runs | default([]) | length > 0
+
+        - name: Get latest workflow run
+          ansible.builtin.set_fact:
+            latest_run_id: "{{ workflow_runs.json.workflow_runs[0].id }}"
+            latest_run_status: "{{ workflow_runs.json.workflow_runs[0].status }}"
+
+        - name: Poll workflow run until complete
+          ansible.builtin.uri:
+            url: "{{ gitea_api }}/repos/{{ gitea_owner }}/{{ gitea_repo }}/actions/runs/{{ latest_run_id }}"
+            method: GET
+            headers:
+              Authorization: "token {{ gitea_token }}"
+            status_code: [200]
+          register: run_status
+          until: run_status.json.status in ['success', 'failure', 'cancelled']
+          retries: 30
+          delay: 15
+
+        - name: Assert workflow succeeded
+          ansible.builtin.assert:
+            that:
+              - run_status.json.status == 'success'
+            fail_msg: "Gitea Actions workflow FAILED — investigate at {{ gitea_url }}/{{ gitea_owner }}/{{ gitea_repo }}/actions"
+            success_msg: "CI/CD pipeline passed — artifact ready for deployment"
+
+        - name: Set rebuilt image tag
+          ansible.builtin.set_fact:
+            rebuilt_image_tag: "{{ demo_app_image_registry }}:{{ cve_id | lower | replace('-', '') }}-fix"
+
+- name: "App Dependency Fix — Deploy Rebuilt Application"
+  hosts: targets
+  become: true
+  gather_facts: true
+  vars_files:
+    - ../vars/vault.yml
+  vars:
+    app_name: "{{ demo_app_name }}"
+    cve_id: "{{ demo_app_cve_id }}"
+
+  tasks:
+    - name: "Phase 3 — Deploy rebuilt application"
+      block:
+        - name: Pre-deploy health check
+          ansible.builtin.uri:
+            url: "http://localhost:{{ demo_app_port }}/health"
+            method: GET
+            status_code: [200]
+          register: pre_deploy_health
+          failed_when: false
+
+        - name: Pull rebuilt container image
+          containers.podman.podman_image:
+            name: "{{ hostvars['localhost']['rebuilt_image_tag'] }}"
+            pull: true
+            force: true
+          when: hostvars['localhost']['rebuilt_image_tag'] is defined
+
+        - name: Stop current application container
+          containers.podman.podman_container:
+            name: "{{ app_name }}"
+            state: stopped
+          failed_when: false
+
+        - name: Start application with rebuilt image
+          containers.podman.podman_container:
+            name: "{{ app_name }}"
+            image: "{{ hostvars['localhost']['rebuilt_image_tag'] | default(demo_app_image_registry + ':latest') }}"
+            state: started
+            restart_policy: always
+            ports:
+              - "{{ demo_app_port }}:8080"
+            env:
+              CVE_FIX_APPLIED: "{{ cve_id }}"
+              LIGHTWELL_FIX: "{{ demo_app_affected_library }}=={{ demo_app_fixed_version }}"
+          register: deploy_result
+
+    - name: "Phase 4 — Post-deploy validation"
+      block:
+        - name: Wait for application startup
+          ansible.builtin.wait_for:
+            port: "{{ demo_app_port }}"
+            timeout: 60
+
+        - name: Post-deploy health check
+          ansible.builtin.uri:
+            url: "http://localhost:{{ demo_app_port }}/health"
+            method: GET
+            status_code: [200]
+          register: post_deploy_health
+          retries: 5
+          delay: 5
+
+        - name: Check library version via app endpoint
+          ansible.builtin.uri:
+            url: "http://localhost:{{ demo_app_port }}/version"
+            method: GET
+            status_code: [200]
+          register: version_check
+
+        - name: Display deployment summary
+          ansible.builtin.debug:
+            msg: |
+              === APP DEPENDENCY REMEDIATION REPORT ===
+              Host: {{ inventory_hostname }}
+              App: {{ app_name }}
+              CVE: {{ cve_id }}
+              Type: app_dependency_rebuild (CI/CD direct)
+              Library: {{ demo_app_affected_library }}=={{ demo_app_fixed_version }}
+              Version endpoint: {{ version_check.json | default({}) }}
+              Healthy: {{ post_deploy_health.status == 200 }}
+              ==========================================
+              NOTE: This was a BUILD-TIME fix via CI/CD.
+              The library is baked into the application image.
+              No host-level package manager was involved.
+              ==========================================
